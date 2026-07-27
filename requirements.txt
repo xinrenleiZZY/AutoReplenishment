@@ -1,0 +1,31 @@
+# Web框架
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# 数据库
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# 数据计算
+pandas==2.2.3
+numpy==2.2.1
+
+# HTTP客户端
+httpx==0.28.1
+
+# 定时任务
+apscheduler==3.10.4
+
+# 数据校验
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# 工具
+python-dotenv==1.0.1
+python-multipart==0.0.19
+
+# 测试
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
