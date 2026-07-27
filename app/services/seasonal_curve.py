@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.product import Product
 from app.models.sales import SalesData
 from app.models.seasonal_curve import SeasonalCurve
+from app.models.festival_calendar import FestivalCalendar
 from app.utils.helpers import safe_json_dumps
 
 logger = logging.getLogger(__name__)
@@ -43,16 +44,43 @@ FESTIVAL_DATES: Dict[str, tuple] = {
 }
 
 
-def _get_festival_date(festival: str, year: int) -> Optional[date]:
+def _get_festival_date(festival: str, year: int, session: Optional[AsyncSession] = None) -> Optional[date]:
     """获取指定年份的节日日期
+
+    优先从数据库 FestivalCalendar 表查询，若失败则回退到硬编码映射表。
 
     Args:
         festival: 节日名称
         year: 年份
+        session: 数据库会话（可选，提供时优先查库）
 
     Returns:
         date对象，如果节日不在映射表中则返回None
     """
+    # 优先从数据库查询
+    if session is not None:
+        import asyncio
+        try:
+            stmt = select(FestivalCalendar).where(FestivalCalendar.festival == festival)
+            result = session.execute(stmt)
+            records = result.scalars().all()
+            if records:
+                # 取最近的日期记录
+                for r in records:
+                    if r.festival_date and r.festival_date.year == year:
+                        return r.festival_date.date()
+                # 没有匹配年份，取festival_date的最接近的一条
+                record = records[0]
+                for r in records:
+                    if r.festival_date and record.festival_date:
+                        if abs(r.festival_date.year - year) < abs(record.festival_date.year - year):
+                            record = r
+                if record.festival_date:
+                    return date(year, record.festival_date.month, record.festival_date.day)
+        except Exception as e:
+            logger.warning(f"FestivalCalendar查询失败: {e}")
+
+    # 回退到硬编码映射表
     month_day = FESTIVAL_DATES.get(festival)
     if not month_day:
         logger.warning(f"节日 {festival} 未在映射表中，使用默认日期")
@@ -299,7 +327,7 @@ async def predict_by_curve(
 
     # 计算售卖截止日期
     today = date.today()
-    festival_date = _get_festival_date(festival, today.year)
+    festival_date = _get_festival_date(festival, today.year, session)
 
     selling_end_date = None
     has_ended = False

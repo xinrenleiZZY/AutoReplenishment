@@ -11,7 +11,7 @@ class Product(Base):
     __tablename__ = "products"
 
     asin: Mapped[str] = mapped_column(String(20), primary_key=True, comment="ASIN编码")
-    product_name: Mapped[str] = mapped_column(String(200), nullable=False, comment="产品名称")
+    product_name: Mapped[str] = mapped_column(Text, nullable=False, comment="产品名称")
     category: Mapped[str | None] = mapped_column(String(100), comment="产品分类（如：毛毡类）")
     sub_category: Mapped[str | None] = mapped_column(String(50), comment="子分类（装饰品/非装饰品）")
     life_cycle: Mapped[str | None] = mapped_column(String(20), comment="生命周期阶段")

@@ -1,0 +1,19 @@
+# 数据库配置
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/auto_replenishment
+
+# 领星API配置
+LX_API_BASE_URL=https://api.lingxing.com
+LX_APP_KEY=your_app_key
+LX_APP_SECRET=your_app_secret
+LX_COMPANY_ID=your_company_id
+
+# 飞书通知配置
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook
+
+# 应用配置
+APP_ENV=development
+APP_DEBUG=true
+SYNC_INTERVAL_HOURS=24
+CALC_INTERVAL_HOURS=24
+DAILY_REPORT_TIME=09:00
+LOG_LEVEL=INFO

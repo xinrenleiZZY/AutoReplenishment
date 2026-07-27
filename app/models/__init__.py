@@ -5,6 +5,8 @@ from app.models.calculation import CalculationResult
 from app.models.seasonal_curve import SeasonalCurve
 from app.models.config import ConfigParam
 from app.models.sync_log import SyncLog
+from app.models.festival_calendar import FestivalCalendar
+from app.models.category_leadtime import CategoryLeadtime
 
 __all__ = [
     "Product",
@@ -14,4 +16,6 @@ __all__ = [
     "SeasonalCurve",
     "ConfigParam",
     "SyncLog",
+    "FestivalCalendar",
+    "CategoryLeadtime",
 ]

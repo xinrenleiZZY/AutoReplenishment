@@ -14,6 +14,7 @@ from app.models.sales import SalesData
 from app.models.inventory import InventorySnapshot
 from app.models.seasonal_curve import SeasonalCurve
 from app.models.calculation import CalculationResult
+from app.services.time_axis import get_sales_phase, check_purchase_window, get_recommended_transport
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,12 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     life_cycle = _identify_lifecycle(product)
     logger.info("Step 2/12 生命周期识别 life_cycle=%s", life_cycle)
 
+    # ── Step 2.5: 销售时间轴判断 ──
+    sales_phase_info = await get_sales_phase(product, session)
+    purchase_window = await check_purchase_window(product, session)
+    logger.info("Step 2.5/12 时间轴判断 phase=%s, can_purchase=%s",
+                sales_phase_info.get("phase"), purchase_window.get("can_purchase"))
+
     # ── Step 3: 分析历史销量 ──
     history = await _analyze_sales_history(asin, session)
     logger.info("Step 3/12 历史销量分析完成 月均=%s", history.get("monthly_avg"))
@@ -71,8 +78,19 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     logger.info("Step 6/12 库存健康分析完成 available=%s, inventory_days=%s",
                 inventory.get("available_stock"), inventory.get("inventory_days"))
 
-    # ── Step 7: 计算采购触发 ──
-    trigger = _calc_purchase_trigger(forecast, inventory, product)
+    # ── Step 7: 计算采购触发（结合时间轴） ──
+    # 如果不在销售季节内或无法赶上采购窗口，强制设置无需采购
+    if not purchase_window.get("can_purchase", True):
+        trigger = {
+            "purchase_trigger": "禁止采购",
+            "reason": purchase_window.get("reason", "无法赶上销售窗口"),
+            "inventory_days": inventory.get("inventory_days", 0),
+            "replenishment_cycle": inventory.get("replenishment_cycle", 30),
+        }
+    else:
+        trigger = _calc_purchase_trigger(forecast, inventory, product)
+        # 补充时间轴原因
+        trigger["reason"] += f" | {sales_phase_info.get('reason', '')}"
     logger.info("Step 7/12 采购触发判断 purchase_trigger=%s", trigger.get("purchase_trigger"))
 
     # ── Step 8: 计算建议数量 ──
@@ -83,8 +101,8 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     batch_plan = _plan_batches(suggested_qty, product)
     logger.info("Step 9/12 批次规划完成 batches=%s", len(batch_plan.get("batches", [])))
 
-    # ── Step 10: 计算评分 ──
-    scoring = _calc_score(forecast, inventory, life_cycle, trigger, product)
+    # ── Step 10: 计算评分（结合时间轴） ──
+    scoring = _calc_score(forecast, inventory, life_cycle, trigger, product, purchase_window)
     logger.info("Step 10/12 采购评分 score=%s, level=%s", scoring.get("purchase_score"), scoring.get("purchase_level"))
 
     # ── Step 11: 存储计算结果 ──
@@ -535,7 +553,7 @@ def _plan_batches(suggested_qty: int, product: Product) -> dict:
 
 
 def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
-                trigger: dict, product: Product) -> dict:
+                trigger: dict, product: Product, purchase_window: dict = None) -> dict:
     """计算采购评分"""
     # 断货风险（25%）
     inventory_days = trigger.get("inventory_days", 30)
@@ -564,8 +582,22 @@ def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
     # 库存紧急（10%）
     urgency = max(0, min(100, round((1 - inventory_days / max(replenishment_cycle, 1)) * 100)))
 
-    # 运输可达（10%）- 默认70分
-    transport_score = 70
+    # 运输可达（10%）- 使用时间轴判断
+    if purchase_window:
+        if purchase_window.get("can_purchase", True):
+            transport = purchase_window.get("recommended_transport", "海运")
+            if transport == "海运":
+                transport_score = 100
+            elif transport == "空派":
+                transport_score = 80
+            elif transport == "快递":
+                transport_score = 60
+            else:
+                transport_score = 50
+        else:
+            transport_score = 0
+    else:
+        transport_score = 70  # 默认
 
     # 总分
     total_score = round(
