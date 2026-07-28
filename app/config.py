@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     EXPRESS_SLOW_DAYS: int = 3
     EXPRESS_PEAK_DAYS: int = 6
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()

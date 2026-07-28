@@ -1,0 +1,64 @@
+services:
+  db:
+    image: postgres:15
+    container_name: auto_replenish_db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=auto_replenishment
+      - TZ=Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d auto_replenishment"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: auto_replenish_api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - TZ=Asia/Shanghai
+      - APP_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/auto_replenishment
+      - LX_API_BASE_URL=${LX_API_BASE_URL:-}
+      - LX_APP_KEY=${LX_APP_KEY:-}
+      - LX_APP_SECRET=${LX_APP_SECRET:-}
+      - LX_COMPANY_ID=${LX_COMPANY_ID:-}
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: auto_replenish_web
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      - API_BASE_URL=http://api:8001
+      - NEXT_TELEMETRY_DISABLED=1
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
