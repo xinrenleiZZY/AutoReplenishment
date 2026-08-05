@@ -125,45 +125,53 @@ def plan_batches(
         logger.info(f"单批次采购: total_qty={total_qty}")
         return batches
 
-    # 多批次规划逻辑
-    if sales_trend == "growing":
+    # 多批次规划逻辑（需求文档第十二章：可拆3批+备用）
+    if total_qty > 5000:
+        # 大批量（>5000）: 3批 + 备用
+        if sales_trend == "growing":
+            ratios = [0.30, 0.25, 0.20, 0.25]  # 首批30%，后续25%/20%，备用25%
+            notes = ["首批30%，快速抢占", "第二批25%，30天后",
+                     "第三批20%，60天后", "备用25%，视销量追加"]
+        elif sales_trend == "declining":
+            ratios = [0.20, 0.15, 0.15, 0.50]  # 首批20%，控制风险，备用50%
+            notes = ["首批20%，控制风险", "第二批15%", "第三批15%", "备用50%，视销售决定"]
+        else:
+            ratios = [0.25, 0.20, 0.15, 0.40]  # 稳定/季节性
+            notes = ["首批25%", "第二批20%", "第三批15%", "备用40%，视销售决定"]
+    elif sales_trend == "growing":
         # 增长趋势：首批60%，第二批40%
-        first_ratio = 0.6
-        second_ratio = 0.4
+        ratios = [0.6, 0.4]
         notes = ["首批60%，满足快速增长需求", "第二批40%，根据销售情况调整"]
     elif sales_trend == "declining":
         # 下降趋势：首批40%，第二批60%（降低风险）
-        first_ratio = 0.4
-        second_ratio = 0.6
+        ratios = [0.4, 0.6]
         notes = ["首批40%，控制风险", "第二批60%，视销售情况再决定"]
     else:
         # 稳定趋势或季节性：首批50%，第二批50%
-        first_ratio = 0.5
-        second_ratio = 0.5
+        ratios = [0.5, 0.5]
         notes = ["首批50%", "第二批50%，视销售情况调整"]
 
     # 计算各批次数量
-    first_qty = _round_to_box(total_qty * first_ratio)
-    second_qty = total_qty - first_qty
+    remaining = total_qty
+    for i, (ratio, note) in enumerate(zip(ratios, notes)):
+        is_last = (i == len(ratios) - 1)
+        if is_last:
+            qty = remaining
+        else:
+            qty = _round_to_box(total_qty * ratio)
+            remaining -= qty
 
-    batches.append({
-        "batch": 1,
-        "qty": first_qty,
-        "ratio": round(first_ratio, 2),
-        "note": notes[0],
-    })
-
-    if second_qty > 0:
-        batches.append({
-            "batch": 2,
-            "qty": second_qty,
-            "ratio": round(second_ratio, 2),
-            "note": notes[1],
-        })
+        if qty > 0:
+            batches.append({
+                "batch": i + 1,
+                "qty": qty,
+                "ratio": round(ratio, 2),
+                "note": note,
+            })
 
     logger.info(
         f"多批次采购: total_qty={total_qty}, "
-        f"批次={len(batches)}, 首批={first_qty}"
+        f"批次={len(batches)}, 首批={batches[0]['qty'] if batches else 0}"
     )
     return batches
 

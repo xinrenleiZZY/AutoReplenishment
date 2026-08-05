@@ -237,9 +237,9 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
     air_days = settings.AIR_PEAK_DAYS
     express_days = settings.EXPRESS_PEAK_DAYS
 
-    # 装饰品：节前12天，非装饰品：节前3天
+    # 装饰品：节前14天，非装饰品：节前3天（需求文档第六章）
     if is_decoration:
-        selling_end_days_before = 12
+        selling_end_days_before = 14
     else:
         selling_end_days_before = 3
     selling_end_date = festival_date - timedelta(days=selling_end_days_before)

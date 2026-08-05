@@ -1,27 +1,76 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { api, type BatchStats, type CalculationResult, type DueStats } from "@/lib/api";
 
 export default function CalculationPage() {
-  const [results, setResults] = useState<any[]>([]);
+  const router = useRouter();
+  const [results, setResults] = useState<CalculationResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [filter, setFilter] = useState("");
+  const [batchStats, setBatchStats] = useState<BatchStats | null>(null);
+  const [dueStats, setDueStats] = useState<DueStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const loadResults = () => {
+  const loadResults = useCallback(() => {
     setLoading(true);
-    const url = filter ? `/api/v1/calculation/results?purchase_level=${filter}` : "/api/v1/calculation/results";
-    fetch(url).then(r => r.json()).then(setResults).catch(() => setResults([])).finally(() => setLoading(false));
-  };
+    api.calculation
+      .results(filter ? { purchase_level: filter, limit: 200 } : { limit: 200 })
+      .then(setResults)
+      .catch((e: Error) => {
+        setResults([]);
+        setError(e.message);
+      })
+      .finally(() => setLoading(false));
+  }, [filter]);
 
-  useEffect(() => { loadResults(); }, [filter]);
+  useEffect(() => { loadResults(); }, [loadResults]);
+
+  useEffect(() => {
+    api.calculation.dueStats().then(setDueStats).catch(() => setDueStats(null));
+  }, []);
 
   const triggerBatch = async () => {
     setRunning(true);
-    await fetch("/api/v1/calculation/trigger/batch", { method: "POST" });
-    alert("批量计算已触发");
-    setRunning(false);
+    setError(null);
+    try {
+      const res = await api.calculation.triggerBatch();
+      setBatchStats(res.stats);
+      loadResults();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "批量计算失败");
+    } finally {
+      setRunning(false);
+    }
   };
+
+  const triggerDue = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      const res = await api.calculation.triggerDue();
+      setBatchStats(res.stats);
+      api.calculation.dueStats().then(setDueStats).catch(() => null);
+      loadResults();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "按频率计算失败");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const levelOrder = ["S", "A", "B", "C", "D"];
+  const levelSummary = dueStats
+    ? levelOrder
+        .filter(lv => dueStats.by_level[lv])
+        .map(lv => {
+          const info = dueStats.by_level[lv];
+          return `${lv}级 ${info.due}/${info.total}（${info.frequency_days}天）`;
+        })
+        .join(" ｜ ")
+    : "";
 
   return (
     <div>
@@ -36,13 +85,37 @@ export default function CalculationPage() {
             <option value="观察">观察</option>
             <option value="暂停">暂停</option>
           </select>
+          <button onClick={triggerDue} disabled={running}
+            className="px-4 py-1.5 rounded-md text-sm font-medium text-white"
+            style={{ backgroundColor: running ? "#94a3b8" : "var(--accent-green)" }}>
+            {running ? "计算中..." : "按频率计算"}
+          </button>
           <button onClick={triggerBatch} disabled={running}
             className="px-4 py-1.5 rounded-md text-sm font-medium text-white"
             style={{ backgroundColor: running ? "#94a3b8" : "var(--accent-blue)" }}>
-            {running ? "计算中..." : "触发批量计算"}
+            全量重算
           </button>
         </div>
       </div>
+
+      {dueStats && (
+        <div className="card mb-4 text-sm">
+          <p style={{ color: "var(--text-tertiary)" }}>
+            今日到期 <strong>{dueStats.due}</strong> / {dueStats.total} 个产品
+          </p>
+          {levelSummary && <p className="mt-1" style={{ color: "var(--text-secondary)" }}>{levelSummary}</p>}
+        </div>
+      )}
+
+      {error && <div className="card mb-4" style={{ borderLeft: "4px solid var(--accent-red)", color: "var(--accent-red)" }}>{error}</div>}
+      {batchStats && (
+        <div className="card mb-4 text-sm" style={{ borderLeft: "4px solid var(--accent-green)" }}>
+          计算完成：到期 <strong>{batchStats.due ?? batchStats.total}</strong> / 跳过 <strong>{batchStats.skipped ?? 0}</strong>，
+          成功 <strong>{batchStats.success}</strong> / 失败 <strong>{batchStats.failed}</strong>，
+          🛒 立即采购 <strong>{batchStats.immediate}</strong> ｜ 👀 观察 <strong>{batchStats.observe}</strong> ｜ ⏸ 暂停 <strong>{batchStats.pause}</strong>
+        </div>
+      )}
+
       {loading && <p>加载中...</p>}
       {!loading && results.length === 0 && <div className="card text-center py-12" style={{ color: "var(--text-tertiary)" }}>暂无计算结果</div>}
       {results.length > 0 && (
@@ -55,7 +128,7 @@ export default function CalculationPage() {
             </tr></thead>
             <tbody>{results.map(r => (
               <tr key={r.id} style={{ borderBottom: "1px solid var(--border-color)" }}
-                onClick={() => window.location.href = `/calculation/${r.asin}`} className="cursor-pointer"
+                onClick={() => router.push(`/calculation/${r.asin}`)} className="cursor-pointer"
                 onMouseEnter={e => e.currentTarget.style.backgroundColor = "var(--hover-bg)"}
                 onMouseLeave={e => e.currentTarget.style.backgroundColor = "transparent"}>
                 <td className="py-2 pr-3 font-mono text-xs">{r.asin}</td>

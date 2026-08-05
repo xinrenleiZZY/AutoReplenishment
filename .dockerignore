@@ -9,9 +9,8 @@ venv
 .gitignore
 docs
 p_id
-scripts
-scraper
 tests
+web
 node_modules
 .next
 *.md
@@ -19,3 +18,5 @@ node_modules
 *.xlsx
 *.jsonl
 *.log
+logs
+playwright_profile

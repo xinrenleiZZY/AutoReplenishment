@@ -33,6 +33,9 @@ class ProductUpdate(BaseModel):
     status: Optional[bool] = None
     operator: Optional[str] = None
     profit_rate: Optional[float] = None
+    life_cycle: Optional[str] = None
+    product_level: Optional[str] = None
+    calc_frequency: Optional[str] = None
 
 
 class ProductResponse(BaseModel):
@@ -42,6 +45,7 @@ class ProductResponse(BaseModel):
     sub_category: Optional[str] = None
     life_cycle: Optional[str] = None
     product_level: Optional[str] = None
+    calc_frequency: Optional[str] = None
     product_type: Optional[str] = None
     product_stage: Optional[str] = None
     festival: Optional[str] = None

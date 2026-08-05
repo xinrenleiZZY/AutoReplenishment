@@ -57,8 +57,8 @@ export default function NavSidebar() {
   };
 
   const isActive = (href: string) => {
-    if (href === "/products") return pathname === "/products" || pathname.startsWith("/products/[");
-    if (href === "/calculation") return pathname === "/calculation" || pathname.startsWith("/calculation/[");
+    if (href === "/products") return pathname === "/products" || pathname.startsWith("/products/");
+    if (href === "/calculation") return pathname === "/calculation" || pathname.startsWith("/calculation/");
     return pathname === href;
   };
   const isGroupActive = (prefix: string) => pathname.startsWith(prefix);

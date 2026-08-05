@@ -31,33 +31,40 @@ async def old_product_forecast(
     session: Optional[AsyncSession] = None,
 ) -> int:
     """
-    老品预测模型
+    老品预测模型（需求文档第七章 v2）
 
-    预测销量 = 历史同期销量 × 趋势修正系数(25%) × 市场修正系数(15%)
-                         × 广告修正系数(10%) × Listing修正系数(10%)
+    未来销量 = 历史同期销量 × 综合修正系数
 
-    各系数的调整幅度由权重缩放:
-      修正系数 = 1 + (系数值 - 1) × 权重
+    权重分配（文档定义）：
+      历史销售基准 40%  ← 去年同期销量（订单量）
+      当前销售趋势 25%  ← 7/14/30天销量增长率
+      市场竞争表现 15%  ← 核心关键词排名变化 + 类目排名变化
+      广告驱动因素 10%  ← ACOS + 广告订单占比
+      Listing健康度 10% ← 评分 + Review数量增长
+
+    综合修正系数 = 0.40 + (趋势系数-1)×0.25 + (市场系数-1)×0.15
+                         + (广告系数-1)×0.10 + (Listing系数-1)×0.10
 
     Args:
         asin: ASIN编码
         target_month: 目标月份（取该月第一天）
-        trend_coeff: 趋势系数（基于30天销量增长率）
-        market_coeff: 市场系数（基于关键词排名+类目排名变化）
-        ad_coeff: 广告系数（基于ACOS+广告订单占比）
-        listing_coeff: Listing系数（基于评分+Review增长）
+        trend_coeff: 趋势系数（基于7/14/30天销量增长率）
+        market_coeff: 市场系数（基于关键词排名+类目排名变化，SIF获取）
+        ad_coeff: 广告系数（基于ACOS+广告订单占比，SIF获取）
+        listing_coeff: Listing系数（基于评分+Review增长，SIF获取）
         session: 数据库会话
 
     Returns:
         预测销量（四舍五入取整）
     """
-    # 权重
+    # 权重（需求文档第七章）
+    HISTORY_WEIGHT = 0.40
     TREND_WEIGHT = 0.25
     MARKET_WEIGHT = 0.15
     AD_WEIGHT = 0.10
     LISTING_WEIGHT = 0.10
 
-    # 查询历史同期销量（去年同月）
+    # 查询历史同期销量（去年同月，对应"历史销售基准"）
     last_year = target_month.year - 1
     last_year_start = date(last_year, target_month.month, 1)
 
@@ -87,22 +94,21 @@ async def old_product_forecast(
         logger.warning(f"[{asin}] 去年同月({last_year_start})无历史销量数据")
         return 0
 
-    # 计算综合修正系数
-    # 每个系数围绕1.0波动，乘以权重后累加
+    # 计算综合修正系数（需求文档权重）
     adjustment = (
-        1.0
-        + (trend_coeff - 1.0) * TREND_WEIGHT
-        + (market_coeff - 1.0) * MARKET_WEIGHT
-        + (ad_coeff - 1.0) * AD_WEIGHT
-        + (listing_coeff - 1.0) * LISTING_WEIGHT
+        HISTORY_WEIGHT                       # 历史基准权重40%（基数）
+        + (trend_coeff - 1.0) * TREND_WEIGHT      # 趋势修正 25%
+        + (market_coeff - 1.0) * MARKET_WEIGHT    # 市场修正 15%
+        + (ad_coeff - 1.0) * AD_WEIGHT            # 广告修正 10%
+        + (listing_coeff - 1.0) * LISTING_WEIGHT  # Listing修正 10%
     )
 
     forecast = round(historical_sales * adjustment)
     logger.info(
         f"[{asin}] 老品预测: 历史销量={historical_sales}, "
-        f"趋势={trend_coeff:.4f}, 市场={market_coeff:.4f}, "
-        f"广告={ad_coeff:.4f}, Listing={listing_coeff:.4f}, "
-        f"修正系数={adjustment:.4f}, 预测={forecast}"
+        f"趋势={trend_coeff:.4f}(25%), 市场={market_coeff:.4f}(15%), "
+        f"广告={ad_coeff:.4f}(10%), Listing={listing_coeff:.4f}(10%), "
+        f"历史权重=40%, 修正系数={adjustment:.4f}, 预测={forecast}"
     )
     return forecast
 

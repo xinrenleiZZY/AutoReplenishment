@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import async_session_factory
 from app.models.product import Product
+from sqlalchemy import select, update
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,8 +54,11 @@ def parse_small_rank(small_rank) -> str:
     return str(small_rank)
 
 
-async def import_products(json_path: str):
-    """从 JSON 全量导入产品数据"""
+async def import_products(json_path: str) -> int:
+    """从 JSON 全量导入产品数据（安全更新：只更新基础字段，不覆盖等级/工期/箱规等维护字段）
+
+    返回更新/插入的记录数。
+    """
     logger.info(f"读取产品数据: {json_path}")
 
     with open(json_path, "r", encoding="utf-8") as f:
@@ -65,9 +69,8 @@ async def import_products(json_path: str):
     session = async_session_factory()
     try:
         async with session:
-            count = 0
+            data_map = {}
             errors = 0
-            batch = []
             for idx, item in enumerate(items):
                 asin = item.get("asin", "").strip()
                 if not asin:
@@ -83,36 +86,41 @@ async def import_products(json_path: str):
                     elif product_type_val == 1:
                         product_type = "长期产品"
 
-                    product = Product(
-                        asin=asin,
-                        product_name=(item.get("item_name") or "")[:2000],
-                        category=category,
-                        sub_category=sub_category,
-                        list_date=parse_open_date(item.get("open_date")),
-                        product_type=product_type,
-                        status=True,
-                        operator=item.get("principal_realname"),
-                    )
-                    batch.append(product)
-                    count += 1
-
-                    if len(batch) >= 500:
-                        for p in batch:
-                            await session.merge(p)
-                        await session.flush()
-                        logger.info(f"  已处理 {count}/{len(items)} 条...")
-                        batch = []
-
+                    values = {
+                        "product_name": (item.get("item_name") or "")[:2000],
+                        "category": category,
+                        "sub_category": sub_category,
+                        "list_date": parse_open_date(item.get("open_date")),
+                        "product_type": product_type,
+                        "status": True,
+                        "operator": item.get("principal_realname"),
+                    }
+                    values = {k: v for k, v in values.items() if v is not None}
+                    data_map[asin] = values
                 except Exception as e:
                     errors += 1
                     if errors <= 5:
                         logger.warning(f"  跳过 ASIN={asin}: {e}")
 
-            # 处理剩余批次
-            for p in batch:
-                await session.merge(p)
+            # 已存在的产品 → 更新基础字段；新产品 → 插入
+            asins = list(data_map.keys())
+            exist = await session.execute(select(Product.asin).where(Product.asin.in_(asins)))
+            exist_set = set(exist.scalars().all())
+            updated = 0
+            inserted = 0
+            for i, (asin, values) in enumerate(data_map.items()):
+                if asin in exist_set:
+                    await session.execute(update(Product).where(Product.asin == asin).values(**values))
+                    updated += 1
+                else:
+                    session.add(Product(asin=asin, **values))
+                    inserted += 1
+                if (i + 1) % 500 == 0:
+                    await session.flush()
+                    logger.info(f"  已处理 {i + 1}/{len(asins)} 条...")
             await session.commit()
-            logger.info(f"导入完成: 成功 {count} 条, 失败 {errors} 条")
+            logger.info(f"导入完成: 更新 {updated} 条, 新增 {inserted} 条, 失败 {errors} 条")
+            return updated + inserted
     finally:
         await session.close()
 

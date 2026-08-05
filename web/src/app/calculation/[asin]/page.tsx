@@ -3,16 +3,38 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import { api, type HistoryItem } from "@/lib/api";
+
+interface StepInfo {
+  step_no: number;
+  step_name: string;
+  status: string;
+  input?: any;
+  output?: any;
+  reason?: string;
+  computed_at?: string;
+}
 
 export default function CalculationDetailPage() {
   const params = useParams();
   const asin = params.asin as string;
   const [result, setResult] = useState<any>(null);
+  const [steps, setSteps] = useState<StepInfo[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [expandedStep, setExpandedStep] = useState<number | null>(null);
 
   useEffect(() => {
-    fetch(`/api/v1/calculation/results/${asin}/latest`)
-      .then(r => r.json().catch(() => null)).then(setResult).finally(() => setLoading(false));
+    Promise.all([
+      api.calculation.latest(asin).catch(() => null),
+      api.calculation.latestSteps(asin).catch(() => null),
+      api.calculation.history(asin).catch(() => [] as HistoryItem[]),
+    ]).then(([res, stepsData, hist]) => {
+      setResult(res);
+      setSteps((stepsData?.steps as StepInfo[] | undefined) || []);
+      setHistory(hist || []);
+      setLoading(false);
+    });
   }, [asin]);
 
   if (loading) return <p>加载中...</p>;
@@ -60,10 +82,10 @@ export default function CalculationDetailPage() {
           {[
             ["采购触发", result.purchase_trigger],
             ["建议采购数量", result.suggested_qty?.toLocaleString()],
-            ["库存覆盖天数", result.inventory_days + " 天"],
-            ["补货周期", result.replenishment_cycle + " 天"],
+            ["库存覆盖天数", result.inventory_days != null ? result.inventory_days + " 天" : "-"],
+            ["补货周期", result.replenishment_cycle != null ? result.replenishment_cycle + " 天" : "-"],
             ["预测总销量", result.forecast_total?.toLocaleString()],
-            ["紧急程度评分", result.urgency_score],
+            ["紧急程度评分", result.urgency_score != null ? result.urgency_score : "-"],
           ].map(([label, value]) => (
             <div key={label} className="flex justify-between py-2 text-sm" style={{ borderBottom: "1px solid var(--border-color)" }}>
               <span style={{ color: "var(--text-tertiary)" }}>{label}</span>
@@ -71,6 +93,118 @@ export default function CalculationDetailPage() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* 历史对比趋势 */}
+      <div className="card mt-6">
+        <h2 className="text-lg font-semibold mb-1">历史对比趋势</h2>
+        <p className="text-sm mb-4" style={{ color: "var(--text-tertiary)" }}>
+          同一 ASIN 不同计算日期的采购评分与建议数量变化（共 {history.length} 次）
+        </p>
+        {history.length < 2 && (
+          <p style={{ color: "var(--text-tertiary)" }}>暂无足够历史数据，连续多日计算后将在此形成趋势。</p>
+        )}
+        {history.length >= 2 && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <TrendChart
+              title="采购评分"
+              items={history}
+              valueOf={h => h.purchase_score ?? 0}
+              max={100}
+              color="var(--accent-blue)"
+            />
+            <TrendChart
+              title="建议采购数量"
+              items={history}
+              valueOf={h => h.suggested_qty ?? 0}
+              max={Math.max(...history.map(h => h.suggested_qty ?? 0), 1)}
+              color="var(--accent-green)"
+            />
+          </div>
+        )}
+      </div>
+
+      {/* 分析过程溯源 */}
+      <div className="card mt-6">
+        <h2 className="text-lg font-semibold mb-1">分析过程溯源</h2>
+        <p className="text-sm mb-4" style={{ color: "var(--text-tertiary)" }}>
+          每一步的输入数据、分析结果和判断依据（共 {steps.length} 步）
+        </p>
+        {steps.length === 0 && <p style={{ color: "var(--text-tertiary)" }}>暂无步骤记录（需重新触发计算后生成）</p>}
+        <div className="space-y-2">
+          {steps.map(step => (
+            <div key={step.step_no} className="rounded-lg" style={{ border: "1px solid var(--border-color)" }}>
+              <button
+                className="w-full flex items-center gap-3 px-4 py-3 text-left"
+                onClick={() => setExpandedStep(expandedStep === step.step_no ? null : step.step_no)}
+              >
+                <span className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold"
+                  style={{ backgroundColor: step.status === "error" ? "#fee2e2" : "var(--bg-tertiary)", color: step.status === "error" ? "#dc2626" : "var(--text-primary)" }}>
+                  {step.step_no}
+                </span>
+                <span className="flex-1 font-medium text-sm">{step.step_name}</span>
+                {step.reason && <span className="text-xs truncate max-w-[40%]" style={{ color: "var(--text-tertiary)" }}>{step.reason}</span>}
+                <span className="text-xs" style={{ color: "var(--text-tertiary)" }}>{expandedStep === step.step_no ? "▲" : "▼"}</span>
+              </button>
+              {expandedStep === step.step_no && (
+                <div className="px-4 pb-4 pt-1 text-sm space-y-3" style={{ borderTop: "1px solid var(--border-color)" }}>
+                  {step.reason && (
+                    <div>
+                      <p className="text-xs mb-1 font-medium" style={{ color: "var(--text-tertiary)" }}>判断依据</p>
+                      <p className="whitespace-pre-wrap">{step.reason}</p>
+                    </div>
+                  )}
+                  {step.output && (
+                    <div>
+                      <p className="text-xs mb-1 font-medium" style={{ color: "var(--text-tertiary)" }}>分析结果</p>
+                      <pre className="rounded p-2 overflow-x-auto text-xs" style={{ backgroundColor: "var(--bg-tertiary)" }}>
+                        {JSON.stringify(step.output, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                  {step.input && (
+                    <div>
+                      <p className="text-xs mb-1 font-medium" style={{ color: "var(--text-tertiary)" }}>输入数据</p>
+                      <pre className="rounded p-2 overflow-x-auto text-xs" style={{ backgroundColor: "var(--bg-tertiary)" }}>
+                        {JSON.stringify(step.input, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                  {step.computed_at && (
+                    <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>计算时间：{step.computed_at}</p>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TrendChart({ title, items, valueOf, max, color }: {
+  title: string;
+  items: HistoryItem[];
+  valueOf: (h: HistoryItem) => number;
+  max: number;
+  color: string;
+}) {
+  return (
+    <div>
+      <h3 className="text-sm font-semibold mb-3">{title}</h3>
+      <div className="flex items-end gap-2 h-40">
+        {items.map(h => {
+          const v = valueOf(h);
+          const hgt = max > 0 ? Math.max((v / max) * 100, 2) : 2;
+          return (
+            <div key={h.calc_date} className="flex-1 flex flex-col items-center gap-1" title={`${h.calc_date}：${v}`}>
+              <span className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>{v}</span>
+              <div className="w-full rounded-t" style={{ height: `${hgt}px`, backgroundColor: color, opacity: 0.85 }} />
+              <span className="text-[10px]" style={{ color: "var(--text-tertiary)" }}>{h.calc_date.slice(5)}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

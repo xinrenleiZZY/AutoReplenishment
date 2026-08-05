@@ -44,3 +44,24 @@ class CalculationResult(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, comment="确认时间")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="创建时间")
+
+
+class CalculationStepResult(Base):
+    """计算步骤结果表 — 每一步的输入/输出/原因，实现可溯源"""
+
+    __tablename__ = "calculation_step_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    calculation_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("calculation_results.id"), index=True,
+        comment="所属计算结果ID"
+    )
+    asin: Mapped[str] = mapped_column(String(20), index=True, comment="ASIN编码")
+    calc_date: Mapped[date] = mapped_column(Date, index=True, comment="计算日期")
+    step_no: Mapped[int] = mapped_column(Integer, comment="步骤序号")
+    step_name: Mapped[str] = mapped_column(String(100), comment="步骤名称")
+    status: Mapped[str] = mapped_column(String(20), default="success", comment="success/error/skip")
+    input_data: Mapped[str | None] = mapped_column(Text, comment="步骤输入数据 JSON")
+    output_data: Mapped[str | None] = mapped_column(Text, comment="步骤输出结果 JSON")
+    reason: Mapped[str | None] = mapped_column(Text, comment="判断依据/原因说明")
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="计算时间")

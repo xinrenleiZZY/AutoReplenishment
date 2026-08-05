@@ -12,6 +12,7 @@ class CalculationResultResponse(BaseModel):
     forecast_total: Optional[int] = None
     available_stock: Optional[int] = None
     inventory_days: Optional[int] = None
+    replenishment_cycle: Optional[int] = None
     urgency_score: Optional[int] = None
     purchase_trigger: Optional[str] = None
     suggested_qty: Optional[int] = None

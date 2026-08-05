@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import { api } from "@/lib/api";
 
 export default function ProductDetailPage() {
   const params = useParams();
@@ -13,8 +14,8 @@ export default function ProductDetailPage() {
 
   useEffect(() => {
     Promise.all([
-      fetch(`/api/v1/products/${asin}`).then(r => r.json()),
-      fetch(`/api/v1/calculation/results/${asin}/latest`).then(r => r.json().catch(() => null)),
+      api.products.get(asin).catch(() => null),
+      api.calculation.latest(asin).catch(() => null),
     ]).then(([prod, calc]) => { setProduct(prod); setLatestCalc(calc); }).finally(() => setLoading(false));
   }, [asin]);
 
@@ -48,7 +49,8 @@ export default function ProductDetailPage() {
           <h2 className="text-lg font-semibold mb-4">生命周期与等级</h2>
           <Row label="阶段" value={<span className="px-2 py-0.5 rounded text-xs font-medium" style={{ backgroundColor: product.product_stage === "新品" ? "#dbeafe" : "#f1f5f9" }}>{product.product_stage || "-"}</span>} />
           <Row label="生命周期" value={product.life_cycle || "-"} />
-          <Row label="等级" value={product.product_level ? <span className="px-2 py-0.5 rounded text-xs font-bold" style={{ backgroundColor: product.product_level === "S" ? "#fef3c7" : "#f1f5f9" }}>{product.product_level}</span> : "-"} />
+          <Row label="等级" value={product.product_level ? <span className="px-2 py-0.5 rounded text-xs font-bold" style={{ backgroundColor: product.product_level === "S" ? "#fef3c7" : product.product_level === "A" ? "#dbeafe" : product.product_level === "B" ? "#dcfce7" : "#f1f5f9", color: product.product_level === "S" ? "#92400e" : product.product_level === "A" ? "#1e40af" : product.product_level === "B" ? "#166534" : "#64748b" }}>{product.product_level}</span> : "-"} />
+          <Row label="计算频率" value={product.calc_frequency ? <span className="px-2 py-0.5 rounded text-xs font-medium" style={{ backgroundColor: "var(--bg-tertiary)" }}>{product.calc_frequency}</span> : "-"} />
           <Row label="工期(天)" value={product.lead_time ?? "-"} />
           <Row label="单箱数量" value={product.box_quantity ?? "-"} />
           <Row label="最低采购量" value={product.min_order_qty ?? "-"} />

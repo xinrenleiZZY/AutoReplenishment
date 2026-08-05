@@ -1,57 +1,40 @@
 services:
-  db:
-    image: postgres:15
-    container_name: auto_replenish_db
-    restart: unless-stopped
-    ports:
-      - "5433:5432"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=auto_replenishment
-      - TZ=Asia/Shanghai
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d auto_replenishment"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
+  # 说明：数据库复用现有独立容器 auto_replenish_db（host 端口 5433，数据卷独立），
+  # 因此本文件不声明 db 服务；全新环境部署时需自行准备 PostgreSQL 并调整 API 的 DATABASE_URL。
   api:
     build:
       context: .
       dockerfile: api/Dockerfile
     container_name: auto_replenish_api
     restart: unless-stopped
+    init: true
     ports:
-      - "8001:8001"
+      - "9101:8001"
+    env_file:
+      - .env
     environment:
       - TZ=Asia/Shanghai
       - APP_ENV=production
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/auto_replenishment
-      - LX_API_BASE_URL=${LX_API_BASE_URL:-}
-      - LX_APP_KEY=${LX_APP_KEY:-}
-      - LX_APP_SECRET=${LX_APP_SECRET:-}
-      - LX_COMPANY_ID=${LX_COMPANY_ID:-}
-      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
-    depends_on:
-      db:
-        condition: service_healthy
+      # 复用现有独立数据库容器（auto_replenish_db，端口5433）
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5433/auto_replenishment
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
       interval: 30s
       timeout: 10s
+      start_period: 20s
       retries: 3
 
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
+      args:
+        API_BASE_URL: http://api:8001
     container_name: auto_replenish_web
     restart: unless-stopped
+    init: true
     ports:
-      - "8000:8000"
+      - "9100:8000"
     environment:
       - TZ=Asia/Shanghai
       - API_BASE_URL=http://api:8001
@@ -59,6 +42,9 @@ services:
     depends_on:
       api:
         condition: service_healthy
-
-volumes:
-  pgdata:
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

@@ -33,6 +33,15 @@ LEVEL_B_THRESHOLD = 1000
 LEVEL_C_THRESHOLD = 300
 LEVEL_D_THRESHOLD = 1
 
+# 等级 → 计算频率（P0最频繁，P4最低频）
+LEVEL_FREQUENCY = {
+    "S": "P0",
+    "A": "P1",
+    "B": "P2",
+    "C": "P3",
+    "D": "P4",
+}
+
 # 新品判定天数
 NEW_PRODUCT_DAYS = 365
 
@@ -168,22 +177,25 @@ async def calculate_product_level(
     product: Product,
     sales_data: Optional[List[SalesData]] = None,
     session: Optional[AsyncSession] = None,
+    forecast_sales: Optional[int] = None,
 ) -> dict:
     """计算产品等级
 
     老品按年销量：S(≥5000), A(2000-4999), B(1000-1999), C(300-999), D(1-299)
-    新品按预测销量（暂无预测时默认返回C级）。
+    新品按预测销量：forecast_sales 传入预测年销量（不传时默认返回C级）
 
     Args:
         product: Product ORM对象
         sales_data: 当年销量数据列表（可选，老品计算用）
         session: 数据库会话（当sales_data为None时用于查询）
+        forecast_sales: 新品预测年销量（新品分级依据）
 
     Returns:
         dict: {
             "asin": str,
             "product_level": str,  # S/A/B/C/D
-            "total_sales": int,    # 年销量
+            "calc_frequency": str, # P0/P1/P2/P3/P4
+            "total_sales": int,    # 年销量或预测销量
             "stage": str,          # 新品/老品
         }
     """
@@ -197,11 +209,15 @@ async def calculate_product_level(
             stage = "老品"
 
     if stage == "新品":
+        total_sales = forecast_sales if forecast_sales is not None else 0
+        level = _map_sales_to_level(total_sales) if forecast_sales is not None else "C"
         return {
             "asin": product.asin,
-            "product_level": "C",
-            "total_sales": 0,
+            "product_level": level,
+            "calc_frequency": LEVEL_FREQUENCY.get(level, "P4"),
+            "total_sales": total_sales,
             "stage": "新品",
+            "based_on": "预测销量",
         }
 
     # 老品：计算年销量
@@ -221,8 +237,10 @@ async def calculate_product_level(
     return {
         "asin": product.asin,
         "product_level": level,
+        "calc_frequency": LEVEL_FREQUENCY.get(level, "P4"),
         "total_sales": total_sales,
         "stage": "老品",
+        "based_on": "年销量",
     }
 
 

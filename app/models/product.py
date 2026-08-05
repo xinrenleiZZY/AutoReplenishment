@@ -16,6 +16,7 @@ class Product(Base):
     sub_category: Mapped[str | None] = mapped_column(String(50), comment="子分类（装饰品/非装饰品）")
     life_cycle: Mapped[str | None] = mapped_column(String(20), comment="生命周期阶段")
     product_level: Mapped[str | None] = mapped_column(String(5), comment="产品等级 S/A/B/C/D")
+    calc_frequency: Mapped[str | None] = mapped_column(String(5), comment="计算频率 P0/P1/P2/P3/P4")
     product_type: Mapped[str | None] = mapped_column(String(20), comment="节日产品/长期产品")
     product_stage: Mapped[str | None] = mapped_column(String(10), comment="新品/老品")
     festival: Mapped[str | None] = mapped_column(String(50), comment="所属节日")

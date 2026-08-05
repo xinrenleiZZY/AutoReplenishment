@@ -1,13 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { api, type CalculationResult } from "@/lib/api";
 
 export default function InventoryPage() {
-  const [results, setResults] = useState<any[]>([]);
+  const [results, setResults] = useState<CalculationResult[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/v1/calculation/results?limit=200").then(r => r.json()).then(setResults).catch(() => setResults([])).finally(() => setLoading(false));
+    api.calculation
+      .results({ limit: 200 })
+      .then(setResults)
+      .catch(() => setResults([]))
+      .finally(() => setLoading(false));
   }, []);
 
   return (

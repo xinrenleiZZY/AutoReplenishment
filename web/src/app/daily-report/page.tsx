@@ -1,25 +1,44 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { api, type DailyReport } from "@/lib/api";
 
 export default function DailyReportPage() {
-  const [report, setReport] = useState<any>(null);
+  const [report, setReport] = useState<DailyReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [pushing, setPushing] = useState(false);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
 
-  const loadReport = () => {
+  const loadReport = useCallback(() => {
     setLoading(true);
-    fetch("/api/v1/calculation/daily-report")
-      .then(r => r.json()).then(setReport).catch(() => setReport(null)).finally(() => setLoading(false));
-  };
+    api.calculation
+      .dailyReport()
+      .then(setReport)
+      .catch(() => setReport(null))
+      .finally(() => setLoading(false));
+  }, []);
 
-  useEffect(() => { loadReport(); }, []);
+  useEffect(() => { loadReport(); }, [loadReport]);
 
   const pushToFeishu = async () => {
     setPushing(true);
-    await fetch("/api/v1/calculation/daily-report/push", { method: "POST" }).then(() => alert("已推送")).catch(() => alert("推送失败"));
-    setPushing(false);
+    setMessage(null);
+    try {
+      const res = await api.calculation.pushReport();
+      setMessage({ ok: true, text: `${res.message}（${res.summary.immediate_count} 个立即采购）` });
+    } catch (e) {
+      setMessage({ ok: false, text: e instanceof Error ? e.message : "推送失败" });
+    } finally {
+      setPushing(false);
+    }
   };
+
+  const stats = [
+    ["总 ASIN", report?.total_asins, ""],
+    ["立即采购", report?.immediate_count, "var(--accent-orange)"],
+    ["观察", report?.observe_count, "var(--accent-blue)"],
+    ["暂停", report?.pause_count, "var(--accent-green)"],
+  ] as const;
 
   return (
     <div>
@@ -29,21 +48,21 @@ export default function DailyReportPage() {
           className="px-4 py-1.5 rounded-md text-sm font-medium text-white"
           style={{ backgroundColor: pushing ? "#94a3b8" : "var(--accent-green)" }}>{pushing ? "推送中..." : "推送飞书"}</button>}
       </div>
+      {message && (
+        <div className="card mb-4 text-sm" style={{ borderLeft: `4px solid ${message.ok ? "var(--accent-green)" : "var(--accent-red)"}`, color: message.ok ? "inherit" : "var(--accent-red)" }}>
+          {message.text}
+        </div>
+      )}
       {loading && <p>加载中...</p>}
       {!loading && !report && <div className="card text-center py-12" style={{ color: "var(--text-tertiary)" }}>暂无日报数据</div>}
       {report && (
         <>
           <p className="text-sm mb-4" style={{ color: "var(--text-tertiary)" }}>日期：{report.calc_date}</p>
           <div className="grid grid-cols-4 gap-4 mb-6">
-            {[
-              ["总 ASIN", report.total_asins, ""],
-              ["立即采购", report.immediate_count, "var(--accent-orange)"],
-              ["观察", report.observe_count, "var(--accent-blue)"],
-              ["暂停", report.pause_count, "var(--accent-green)"],
-            ].map(([label, val, color]) => (
-              <div className="stat-card" style={{ borderLeft: color ? `4px solid ${color}` : "" }}>
+            {stats.map(([label, val, color]) => (
+              <div key={label} className="stat-card" style={{ borderLeft: color ? `4px solid ${color}` : "" }}>
                 <p className="text-sm" style={{ color: "var(--text-tertiary)" }}>{label}</p>
-                <p className="text-2xl font-bold" style={{ color: color || "inherit" }}>{val}</p>
+                <p className="text-2xl font-bold" style={{ color: color || "inherit" }}>{val ?? "-"}</p>
               </div>
             ))}
           </div>
@@ -59,8 +78,8 @@ export default function DailyReportPage() {
                     <th className="text-right py-2 pr-3">建议数量</th>
                     <th className="text-right py-2">库存天数</th>
                   </tr></thead>
-                  <tbody>{report.results.map((r: any, i: number) => (
-                    <tr key={i} style={{ borderBottom: "1px solid var(--border-color)" }}>
+                  <tbody>{report.results.map((r, i) => (
+                    <tr key={r.asin || i} style={{ borderBottom: "1px solid var(--border-color)" }}>
                       <td className="py-1.5 pr-3 font-mono text-xs">{r.asin}</td>
                       <td className="py-1.5 pr-3 text-center">{r.purchase_score ?? "-"}</td>
                       <td className="py-1.5 pr-3 text-center">
