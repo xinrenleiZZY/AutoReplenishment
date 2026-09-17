@@ -39,9 +39,10 @@ def _to_dt(value):
     if isinstance(value, datetime):
         return value
     if isinstance(value, (int, float)):
-        # Excel 序列号
+        # Excel 序列号（自 1899-12-30 起天数）
         try:
-            return datetime(1899, 12, 30) + __import__("timedelta", fromlist=["timedelta"])
+            from datetime import timedelta
+            return datetime(1899, 12, 30) + timedelta(days=int(value))
         except Exception:
             return None
     if isinstance(value, str):

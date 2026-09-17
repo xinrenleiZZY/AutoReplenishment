@@ -1,8 +1,11 @@
 """检查抓取的产品数据结构和字段"""
 import json
+from pathlib import Path
+
+_pid = Path(__file__).resolve().parent.parent / "p_id"
 
 # 先看全量JSON
-with open(r"e:\ZY2026\yy021-自动补货决策系统\p_id\msku_id_full.json", "r", encoding="utf-8") as f:
+with open(_pid / "msku_id_full.json", "r", encoding="utf-8") as f:
     data = json.load(f)
 
 print(f"全量JSON: {len(data)} 条")

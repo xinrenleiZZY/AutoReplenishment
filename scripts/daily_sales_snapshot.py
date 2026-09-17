@@ -34,6 +34,7 @@ load_dotenv()
 
 from app.database import async_session_factory
 from app.models.daily_snapshot import DailySalesSnapshot
+from app.services.raw_store import collect_raw, flush_raw
 
 # ============ 配置 ============
 SALES_HISTORY_DIR = os.path.join(BASE_DIR, "p_id", "sales_history")
@@ -93,8 +94,26 @@ HEADERS = {
 }
 
 
-def fetch_page(offset: int, seq: int) -> dict:
-    """获取一页产品数据"""
+def _refresh_auth_token() -> bool:
+    """鉴权失败时调用独立模块刷新 token（CDP 自动登录+捕获），并重载 HEADERS"""
+    global AUTH_TOKEN
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from browser_api.lingxing_auth import LingxingAuth
+        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
+        token = LingxingAuth(cdp_port=cdp_port).ensure_token()
+        if token:
+            AUTH_TOKEN = token
+            HEADERS["auth-token"] = token
+            print(f"[INFO] auth-token 已自动刷新: {token[:15]}...")
+            return True
+    except Exception as e:
+        print(f"[WARN] 自动刷新 token 失败: {e}")
+    return False
+
+
+def fetch_page(offset: int, seq: int, allow_refresh: bool = True) -> dict:
+    """获取一页产品数据（鉴权失败时自动刷新 token 重试一次）"""
     payload = {
         "offset": offset,
         "length": PER_PAGE,
@@ -111,8 +130,15 @@ def fetch_page(offset: int, seq: int) -> dict:
     resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+    collect_raw("showOnline", data, url=API_URL, method="POST",
+                params=payload, status_code=resp.status_code)
     if data.get("code") != 1:
-        raise Exception(f"API error: code={data.get('code')}, msg={data.get('msg')}")
+        err = f"API error: code={data.get('code')}, msg={data.get('msg')}"
+        if allow_refresh and (str(data.get("code")) == "8003" or "鉴权" in str(data.get("msg"))):
+            print(f"[WARN] 鉴权失败({err})，尝试自动刷新 token...")
+            if _refresh_auth_token():
+                return fetch_page(offset, seq, allow_refresh=False)
+        raise Exception(err)
     return data.get("data", {})
 
 
@@ -131,6 +157,27 @@ def extract_sales_data(item: dict) -> dict:
     return result
 
 
+def _vol30(d: dict) -> int:
+    """取近30天销量（int），供同 ASIN 多 msku 归并时比较"""
+    try:
+        return int(float((d or {}).get("thirty_volume") or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _merge_by_asin(snapshots: dict, asin: str, item: dict):
+    """同 ASIN 多 msku（showOnline 按 msku 行返回）→ 同量保大 + 列级非0合并。
+
+    以近30天销量大的一行为基础，基础行为 0 的数值列取其他行的非 0 值合并，
+    避免 0 销量 msku 顺序覆盖真实销量行（如 B01FS7W9MQ 挂 12 个 msku，
+    仅 colorful fan 有销量，其余 11 个为 0）。
+    """
+    rec = extract_sales_data(item)
+    prev = snapshots.get(asin)
+    from utils.asin_merge import merge_asin_records
+    snapshots[asin] = merge_asin_records(prev, rec) or rec
+
+
 def take_snapshot(snapshot_date: str = None, write_db: bool = True):
     """
     获取全量产品销量快照
@@ -147,7 +194,7 @@ def take_snapshot(snapshot_date: str = None, write_db: bool = True):
     if os.path.exists(output_path):
         print(f"[{snapshot_date}] 快照已存在: {output_path}")
         print("如需重新抓取，请删除该文件后重试")
-        return
+        return None, snapshot_date
 
     print(f"[{snapshot_date}] 开始抓取销量快照...")
 
@@ -164,7 +211,7 @@ def take_snapshot(snapshot_date: str = None, write_db: bool = True):
     for item in first.get("list", []):
         asin = item.get("asin", "")
         if asin:
-            snapshots[asin] = extract_sales_data(item)
+            _merge_by_asin(snapshots, asin, item)
     print(f"  第1页: {len(first.get('list', []))} 条")
 
     # 后续页
@@ -178,7 +225,7 @@ def take_snapshot(snapshot_date: str = None, write_db: bool = True):
             for item in items:
                 asin = item.get("asin", "")
                 if asin:
-                    snapshots[asin] = extract_sales_data(item)
+                    _merge_by_asin(snapshots, asin, item)
             print(f"  第{page+1}页 (offset={offset}): {len(items)} 条")
         except Exception as e:
             print(f"  第{page+1}页失败: {e}")
@@ -206,6 +253,7 @@ def take_snapshot(snapshot_date: str = None, write_db: bool = True):
     # 汇总统计
     total_vol = sum(int(s.get("yesterday_volume", 0) or 0) for s in snapshots.values())
     print(f"  昨日总销量: {total_vol}")
+    return snapshots, snapshot_date
 
 
 def _to_int(v):
@@ -237,15 +285,28 @@ async def save_snapshots_to_db(snapshots: dict, snapshot_date: str):
             from sqlalchemy import select, delete
             from app.models.product import Product
 
-            # 补齐缺失的产品档案（保证外键与统一数据源）
+            # 补齐缺失的产品档案（跳过排除列表，避免已删除 ASIN 被重新引入，
+            # 如 B0DHTJZ2YC/B0B1X3QJ37/B0D69G91FH 已删除但领星仍有数据）
+            exclude = set()
+            try:
+                from app.services.config_service import get_param
+                raw = await get_param(session, "listing_exclude_asins")
+                for x in str(raw or "").replace("\n", ",").split(","):
+                    x = x.strip().upper()
+                    if x:
+                        exclude.add(x)
+            except Exception:  # noqa: BLE001
+                exclude = set()
             exist_rows = await session.execute(select(Product.asin).where(Product.asin.in_(list(snapshots.keys()))))
             exist_asins = set(exist_rows.scalars().all())
-            missing = [a for a in snapshots if a not in exist_asins]
+            missing = [a for a in snapshots if a not in exist_asins and a not in exclude]
+            # 排除列表中的 ASIN 不写入快照（已删除/停用产品）
+            snapshots = {a: d for a, d in snapshots.items() if a in exist_asins or a in set(missing)}
             if missing:
                 for a in missing:
                     session.add(Product(asin=a, product_name=f"待补全 {a}", status=True))
                 await session.flush()
-                print(f"  [DB] 补齐缺失产品档案 {len(missing)} 条")
+                print(f"  [DB] 补齐缺失产品档案 {len(missing)} 条（已跳过排除列表 {len(exclude)} 个）")
 
             # 幂等：先清当日旧数据再插入
             await session.execute(delete(DailySalesSnapshot).where(
@@ -336,3 +397,4 @@ if __name__ == "__main__":
         import_json_to_db(args.date)
     else:
         take_snapshot(args.date, write_db=not args.no_db)
+        asyncio.run(flush_raw())

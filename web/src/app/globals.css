@@ -13,6 +13,14 @@
   --text-primary: #0f172a;
   --text-secondary: #475569;
   --text-tertiary: #94a3b8;
+  --card-bg: #ffffff;
+  --card-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+
+  /* 科技感增强（endspace 风格） */
+  --endspace-accent: #3b82f6;
+  --endspace-accent-dim: rgba(59, 130, 246, 0.15);
+  --endspace-grid-color: rgba(0, 0, 0, 0.03);
+  --endspace-border-active: #3b82f6;
 }
 
 .dark {
@@ -24,6 +32,13 @@
   --text-primary: #f1f5f9;
   --text-secondary: #94a3b8;
   --text-tertiary: #64748b;
+  --card-bg: #1e293b;
+  --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+
+  --endspace-accent: #58a6ff;
+  --endspace-accent-dim: rgba(88, 166, 255, 0.15);
+  --endspace-grid-color: rgba(255, 255, 255, 0.02);
+  --endspace-border-active: #58a6ff;
 }
 
 body {
@@ -48,4 +63,82 @@ body {
 }
 .stat-card:hover {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+/* ─── 滚动横幅 marquee ─── */
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.animate-marquee {
+  animation: marquee 20s linear infinite;
+}
+
+/* ─── 仪表盘艺术彩字（逐字渐变流光，悬浮更亮） ─── */
+.artistic-title {
+  cursor: pointer;
+  user-select: none;
+}
+.artistic-char {
+  display: inline-block;
+  background: linear-gradient(120deg, #22d3ee, #34d399, #fbbf24, #a78bfa, #f87171, #22d3ee);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent !important;
+  text-shadow: 0 0 18px rgba(34, 211, 238, 0.35);
+  animation: artisticFlow 5s linear infinite;
+  transition: transform 0.25s ease, filter 0.25s ease;
+}
+.artistic-title:hover .artistic-char {
+  transform: translateY(-3px) scale(1.12);
+  filter: brightness(1.4) drop-shadow(0 0 12px rgba(52, 211, 153, 0.9));
+}
+@keyframes artisticFlow {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 300% 50%; }
+}
+
+/* 侧边栏「仪表盘」艺术彩字 */
+.artistic-nav {
+  background: linear-gradient(120deg, #22d3ee, #34d399, #fbbf24);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  font-weight: 700;
+}
+
+/* ─── 卡片悬浮效果 ─── */
+.hzx-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: var(--card-shadow);
+  position: relative;
+}
+.hzx-card:hover {
+  border-color: var(--endspace-border-active);
+  box-shadow:
+    0 4px 12px rgba(0, 0, 0, 0.1),
+    0 0 0 1px var(--endspace-accent-dim);
+  transform: translateY(-2px);
+}
+
+/* ─── 滚动条 ─── */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
 }

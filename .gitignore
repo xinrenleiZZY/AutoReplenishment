@@ -16,6 +16,9 @@ venv/
 # Browser automation profile (contains login sessions / cookies)
 playwright_profile/
 
+# Playwright browser binaries (863MB, injected into Docker image at build time)
+ms-playwright/
+
 # Local proxy subscription with credentials
 docs/1.yaml
 

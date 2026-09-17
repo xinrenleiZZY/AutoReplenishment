@@ -4,8 +4,8 @@
 提供老品和新品两种预测模型，以及综合预测未来N月功能。
 """
 
+import calendar
 import logging
-import json
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
@@ -15,10 +15,99 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.sales import SalesData
 from app.models.product import Product
-from app.models.seasonal_curve import SeasonalCurve
+from app.services.sales_fallback import sum_daily_sales_dual
+from app.services.festival_lifecycle import lifecycle_end_date
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def month_lifecycle_ratio(year: int, month: int, lifecycle_end: date | None) -> float:
+    """结束月按剩余天数折算的比例（把节日生命周期截断从「月」细化到「日」）
+
+    - 1.0：lifecycle_end 为空，或落在该月最后一天之后（整月计入）
+    - 0.0：该月在 lifecycle_end 之后（整月不计入）
+    - 0<x<1：lifecycle_end 落在该月内（如 10-20 结束 → 只计 10-01~10-20）
+    """
+    if lifecycle_end is None:
+        return 1.0
+    last_day = calendar.monthrange(year, month)[1]
+    month_start = date(year, month, 1)
+    if lifecycle_end >= date(year, month, last_day):
+        return 1.0
+    if lifecycle_end < month_start:
+        return 0.0
+    return ((lifecycle_end - month_start).days + 1) / last_day
+
+
+def compute_trend_coeff(seven_volume: int | None, fourteen_volume: int | None, thirty_volume: int | None) -> float:
+    """趋势系数：近7天日均 vs 前7天日均增长率（来自每日快照 7/14/30天销量）"""
+    seven = int(seven_volume or 0)
+    fourteen = int(fourteen_volume or 0)
+    recent7 = seven / 7
+    prev7 = max(fourteen - seven, 0) / 7
+    if prev7 > 0:
+        growth = (recent7 - prev7) / prev7
+    else:
+        growth = 0.0
+    return round(min(max(1.0 + growth, 0.5), 1.5), 3)
+
+
+def compute_ad_coeff(ad_spend_ratio: float | None = None, acos: float | None = None) -> float:
+    """广告系数：30天广告花费占销售额比（近似ACOS）。ACOS越低广告效率越高→上调预测"""
+    ratio = acos if acos is not None else ad_spend_ratio
+    if ratio is None:
+        return 1.0
+    try:
+        ratio = float(ratio)
+    except (ValueError, TypeError):
+        return 1.0
+    if ratio <= 0.15:
+        return 1.10
+    if ratio <= 0.30:
+        return 1.05
+    if ratio <= 0.55:
+        return 1.00
+    return 0.85
+
+
+def compute_listing_coeff(rating: float | None = None, review_growth: float | None = None) -> float:
+    """Listing健康度系数：评分（4星为基准）+ 评论增长"""
+    base = 1.0
+    if rating is not None:
+        try:
+            base += (float(rating) - 4.0) * 0.05
+        except (ValueError, TypeError):
+            pass
+    if review_growth is not None:
+        try:
+            base += max(min(float(review_growth), 0.1), -0.1)
+        except (ValueError, TypeError):
+            pass
+    return round(min(max(base, 0.8), 1.2), 3)
+
+
+def compute_market_coeff(category_rank: int | None = None, prev_rank: int | None = None) -> float:
+    """市场竞争系数：类目排名变化（上升→上调）；无历史排名时按当前档位"""
+    if category_rank is None:
+        return 1.0
+    try:
+        rank = float(category_rank)
+    except (ValueError, TypeError):
+        return 1.0
+    if prev_rank is not None:
+        try:
+            prev = float(prev_rank)
+            if prev > 0:
+                change = (prev - rank) / prev  # 正值 = 排名上升
+                return round(min(max(1.0 + change * 0.3, 0.8), 1.2), 3)
+        except (ValueError, TypeError):
+            pass
+    if rank < 10000:
+        return 1.1
+    if rank <= 50000:
+        return 1.0
+    return 0.9
 
 
 async def old_product_forecast(
@@ -90,6 +179,12 @@ async def old_product_forecast(
         result = await session.execute(query)
         historical_sales = result.scalar() or 0
 
+    # 双源优先：daily_sales_stats（逐日实抓）读去年同月销量，缺时回退 sales_data
+    if historical_sales == 0 and session is not None:
+        fb_hist = await sum_daily_sales_dual(asin, last_year_start, last_year_end, session)
+        if fb_hist:
+            historical_sales = fb_hist
+
     if historical_sales == 0:
         logger.warning(f"[{asin}] 去年同月({last_year_start})无历史销量数据")
         return 0
@@ -146,40 +241,8 @@ async def new_product_forecast(
     Returns:
         预测销量
     """
-    # 获取季节曲线占比
-    month_ratio = 0.0
-    product = None
-
-    if session is not None:
-        # 查询产品信息获取节日和子分类
-        prod_query = select(Product).where(Product.asin == asin)
-        prod_result = await session.execute(prod_query)
-        product = prod_result.scalar_one_or_none()
-
-    if product and product.festival:
-        # 查询对应的季节曲线
-        curve_query = (
-            select(SeasonalCurve)
-            .where(
-                SeasonalCurve.festival == product.festival,
-                SeasonalCurve.sub_category == (product.sub_category or "装饰品"),
-            )
-        )
-        curve_result = await session.execute(curve_query)
-        curve = curve_result.scalar_one_or_none()
-
-        if curve and curve.month_distribution:
-            try:
-                distribution = json.loads(curve.month_distribution)
-                month_key = str(target_month.month)
-                month_ratio = float(distribution.get(month_key, 0))
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(f"[{asin}] 季节曲线数据解析失败: {curve.month_distribution}")
-                month_ratio = 1.0 / 12  # 默认平均分配
-    else:
-        # 无节日信息或查询失败，默认平均分配
-        month_ratio = 1.0 / 12
-        logger.info(f"[{asin}] 无季节曲线数据，默认均分 month_ratio={month_ratio:.4f}")
+    # 季节曲线已停用：按月均分（1/12）
+    month_ratio = 1.0 / 12
 
     # 推算年预测总量
     if annual_forecast is None:
@@ -215,6 +278,8 @@ async def forecast_all_months(
 
     老品走 old_product_forecast，新品走 new_product_forecast。
     返回按月份拆分的预测明细。
+    若节日生命周期结束时间落在预测窗口内（除外节日见 festival_lifecycle.lifecycle_end_date），
+    则只预测到该结束日，结束月按剩余天数折算，其后月份不再计入。
 
     Args:
         asin: ASIN编码
@@ -245,6 +310,12 @@ async def forecast_all_months(
         prod_result = await session.execute(prod_query)
         product = prod_result.scalar_one_or_none()
 
+    # 节日生命周期结束时间落在预测窗口内 → 只预测到结束月即可
+    # （除外节日：长期产品、感恩节、圣诞节、秋季类/冬季类、农历新年、跨年、情人节等）
+    lifecycle_end = None
+    if product is not None:
+        lifecycle_end = await lifecycle_end_date(product, session, today)
+
     monthly_forecasts = []
 
     for i in range(forecast_months):
@@ -254,24 +325,38 @@ async def forecast_all_months(
         month = ((month - 1) % 12) + 1
         target_month = date(year, month, 1)
 
+        # 节日生命周期结束日截断（日粒度）：结束月按剩余天数折算，其后月份不再计入
+        ratio = month_lifecycle_ratio(year, month, lifecycle_end)
+        if ratio <= 0:
+            break
+
         if is_new_product:
+            new_kwargs = {k: v for k, v in kwargs.items()
+                          if k in ("trend_coeff", "ad_coeff", "listing_coeff")}
             forecast = await new_product_forecast(
                 asin=asin,
                 target_month=target_month,
                 session=session,
-                **kwargs,
+                **new_kwargs,
             )
         else:
+            old_kwargs = {k: v for k, v in kwargs.items()
+                          if k in ("trend_coeff", "market_coeff", "ad_coeff", "listing_coeff")}
             forecast = await old_product_forecast(
                 asin=asin,
                 target_month=target_month,
                 session=session,
-                **kwargs,
+                **old_kwargs,
             )
+
+        # 结束月按剩余天数折算（如生命周期 10-20 结束 → 10 月只计 10-01~10-20）
+        if ratio < 1:
+            forecast = round(forecast * ratio)
 
         monthly_forecasts.append({
             "month": target_month.isoformat(),
             "forecast": forecast,
+            "days_ratio": round(ratio, 4),
         })
 
     total = sum(item["forecast"] for item in monthly_forecasts)
@@ -284,6 +369,7 @@ async def forecast_all_months(
         "total": total,
     }
     logger.info(
-        f"[{asin}] 综合预测完成: 未来{forecast_months}月总计={total}"
+        f"[{asin}] 综合预测完成: 计划{forecast_months}月，实预测{len(monthly_forecasts)}月"
+        f"{f'（截止节日生命周期结束 {lifecycle_end.isoformat()}）' if lifecycle_end else ''}，总计={total}"
     )
     return result

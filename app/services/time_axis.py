@@ -9,6 +9,7 @@
 """
 
 import logging
+import json
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -49,7 +50,14 @@ async def get_festival_info(festival: str, session: AsyncSession) -> Optional[di
             "hot_period": str,            # 热卖期描述
         } 或 None
     """
-    stmt = select(FestivalCalendar).where(FestivalCalendar.festival == festival)
+    # 名称可能不匹配（产品"基督教主题" vs 表"Christian基督教主题"），先做名称匹配
+    from app.services.festival_lifecycle import match_festival_name
+
+    name = await match_festival_name(festival, session)
+    if not name:
+        logger.warning(f"未找到节日信息: {festival}")
+        return None
+    stmt = select(FestivalCalendar).where(FestivalCalendar.festival == name)
     result = await session.execute(stmt)
     records = result.scalars().all()
 
@@ -72,7 +80,43 @@ async def get_festival_info(festival: str, session: AsyncSession) -> Optional[di
         "hot_start_month": record.hot_start_month,
         "hot_end_month": record.hot_end_month,
         "hot_period": record.hot_period,
+        "festival_periods": _parse_periods(record.festival_periods),
     }
+
+
+def _parse_periods(raw: str | None) -> list:
+    """解析 festival_periods JSON → [{start: date, end: date, label: str}]"""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    out = []
+    for p in data or []:
+        try:
+            start = date.fromisoformat(str(p["start"]))
+            end = date.fromisoformat(str(p.get("end") or p["start"]))
+            out.append({"start": start, "end": end, "label": str(p.get("label") or "")})
+        except (KeyError, ValueError):
+            continue
+    return out
+
+
+def _target_festival_date(festival_info: dict, today: date):
+    """返回 (目标节日日期, 是否正处于时间段内)
+
+    有多个时间段时取最近的未开始时间段起点；全部已结束时取最后一段结束日；
+    无时间段则回退 festival_date。
+    """
+    periods = festival_info.get("festival_periods") or []
+    if not periods:
+        return festival_info.get("festival_date"), False
+    in_period = any(p["start"] <= today <= p["end"] for p in periods)
+    upcoming = [p["start"] for p in periods if p["start"] >= today]
+    if upcoming:
+        return min(upcoming), in_period
+    return max(p["end"] for p in periods), in_period
 
 
 async def get_sales_phase(product: Product, session: AsyncSession) -> dict:
@@ -92,7 +136,17 @@ async def get_sales_phase(product: Product, session: AsyncSession) -> dict:
             "is_in_season": bool,        # 是否在销售季节内
             "reason": str,               # 判断理由
         }
+
+    长期产品（product_type=长期产品）全年销售不过季 → 直接"正常销售"。
     """
+    if (getattr(product, "product_type", "") or "") == "长期产品":
+        return {
+            "phase": PHASE_NORMAL,
+            "festival_info": None,
+            "days_to_festival": None,
+            "is_in_season": True,
+            "reason": "长期产品，全年销售不过季",
+        }
     if not product.festival:
         return {
             "phase": PHASE_NORMAL,
@@ -113,7 +167,8 @@ async def get_sales_phase(product: Product, session: AsyncSession) -> dict:
         }
 
     today = date.today()
-    festival_date = festival_info.get("festival_date")
+    periods = festival_info.get("festival_periods") or []
+    festival_date, in_period = _target_festival_date(festival_info, today)
     listing_start = festival_info.get("listing_start")
 
     if not festival_date:
@@ -123,6 +178,16 @@ async def get_sales_phase(product: Product, session: AsyncSession) -> dict:
             "days_to_festival": None,
             "is_in_season": True,
             "reason": f"节日 {product.festival} 无具体日期，按正常销售处理",
+        }
+
+    # 正处于某销售时间段内 → 峰值
+    if in_period:
+        return {
+            "phase": PHASE_PEAK,
+            "festival_info": festival_info,
+            "days_to_festival": 0,
+            "is_in_season": True,
+            "reason": f"正处于 {product.festival} 销售时间段内，销售峰值",
         }
 
     days_to_festival = (festival_date - today).days
@@ -205,7 +270,17 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
             "days_remaining": int,             # 剩余天数
             "reason": str,
         }
+
+    长期产品（product_type=长期产品）全年销售不过季 → 无时间限制可采购。
     """
+    if (getattr(product, "product_type", "") or "") == "长期产品":
+        return {
+            "can_purchase": True,
+            "recommended_transport": "海运",
+            "latest_purchase_date": None,
+            "days_remaining": 365,
+            "reason": "长期产品，全年销售不过季，无时间限制",
+        }
     if not product.festival:
         return {
             "can_purchase": True,
@@ -226,7 +301,25 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
         }
 
     today = date.today()
-    festival_date = festival_info["festival_date"]
+    periods = festival_info.get("festival_periods") or []
+    festival_date, in_period = _target_festival_date(festival_info, today)
+    if not festival_date:
+        return {
+            "can_purchase": True,
+            "recommended_transport": "海运",
+            "latest_purchase_date": None,
+            "days_remaining": 365,
+            "reason": f"节日 {product.festival} 信息不全，无时间限制",
+        }
+    # 已进入或已过全部销售时间段 → 无法赶上
+    if in_period or (periods and not any(p["start"] >= today for p in periods)):
+        return {
+            "can_purchase": False,
+            "recommended_transport": "无法赶上",
+            "latest_purchase_date": None,
+            "days_remaining": 0,
+            "reason": f"{product.festival} 销售时间段已开始或已结束，无法赶上采购窗口",
+        }
     lead_time = product.lead_time or 30
 
     # 判断产品类型以确定售卖截止日
@@ -244,10 +337,11 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
         selling_end_days_before = 3
     selling_end_date = festival_date - timedelta(days=selling_end_days_before)
 
-    # 计算各运输方式的最晚采购日期
-    latest_sea = selling_end_date - timedelta(days=lead_time + sea_days)
-    latest_air = selling_end_date - timedelta(days=lead_time + air_days)
-    latest_express = selling_end_date - timedelta(days=lead_time + express_days)
+    # 计算各运输方式的最晚采购日期（结果统一再提前 PURCHASE_BUFFER_DAYS 天作为缓冲）
+    PURCHASE_BUFFER_DAYS = 3
+    latest_sea = selling_end_date - timedelta(days=lead_time + sea_days + PURCHASE_BUFFER_DAYS)
+    latest_air = selling_end_date - timedelta(days=lead_time + air_days + PURCHASE_BUFFER_DAYS)
+    latest_express = selling_end_date - timedelta(days=lead_time + express_days + PURCHASE_BUFFER_DAYS)
 
     days_to_sea = (latest_sea - today).days
     days_to_air = (latest_air - today).days
@@ -270,12 +364,14 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
             "reason": f"海运来不及，空派可赶上，最晚采购日{latest_air}，剩余{days_to_air}天",
         }
     elif days_to_express >= 0:
+        # 仅快递可赶上 = 备货窗口已近关闭，采购过急且快递运费过高 → 视为过季/无法从容备货，不采购
         return {
-            "can_purchase": True,
-            "recommended_transport": "快递",
+            "can_purchase": False,
+            "recommended_transport": "仅快递",
             "latest_purchase_date": latest_express,
             "days_remaining": days_to_express,
-            "reason": f"仅快递可赶上，最晚采购日{latest_express}，剩余{days_to_express}天",
+            "reason": (f"仅快递可赶上（最晚{latest_express}，剩余{days_to_express}天），"
+                       "海运/空运均来不及，备货过急运费过高，视为过季不采购"),
         }
     else:
         return {

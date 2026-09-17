@@ -12,9 +12,15 @@ services:
       - "9101:8001"
     env_file:
       - .env
+    volumes:
+      # 挂载 p_id 数据目录（产品/箱规/标签/销量快照文件），同步抓取结果同时持久化到宿主机
+      - ./p_id:/app/p_id
     environment:
       - TZ=Asia/Shanghai
       - APP_ENV=production
+      # 容器内鉴权失败时可连接宿主机浏览器(转发器18899→18800)自动刷新领星登录态
+      - LX_CDP_HOST=host.docker.internal
+      - LX_CDP_PORT=18899
       # 复用现有独立数据库容器（auto_replenish_db，端口5433）
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5433/auto_replenishment
     healthcheck:

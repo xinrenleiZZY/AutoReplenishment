@@ -21,6 +21,7 @@ from datetime import date, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import select, delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.database import async_session_factory
 from app.models.daily_snapshot import DailySalesSnapshot
 from app.models.sales import SalesData
@@ -90,13 +91,15 @@ async def snapshot_to_daily(snapshot_date: str | None = None, dry_run: bool = Fa
                             SalesData.asin == snap.asin,
                             SalesData.data_source == "snapshot_split",
                         ))
-                        for d, q in daily:
-                            s.add(SalesData(
-                                asin=snap.asin,
-                                date=d,
-                                sales_qty=round(q),
-                                data_source="snapshot_split",
-                            ))
+                        # 批量插入（ON CONFLICT DO NOTHING：撞上 lx 等其它来源的同日记录时跳过，不整批失败）
+                        await s.execute(
+                            pg_insert(SalesData)
+                            .values([
+                                {"asin": snap.asin, "date": d, "sales_qty": round(q), "data_source": "snapshot_split"}
+                                for d, q in daily
+                            ])
+                            .on_conflict_do_nothing(index_elements=["asin", "date"])
+                        )
             if not dry_run:
                 await s.commit()
                 print(f"已写入 sales_data：{total_records} 条日明细，覆盖 {with_daily} 个ASIN")

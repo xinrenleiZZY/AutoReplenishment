@@ -1,22 +1,16 @@
 """产品生命周期识别模块
 
 功能：
-1. identify_stage - 判断新品/老品（上架≤1年=新品）
-2. identify_lifecycle - 识别产品生命周期阶段（启动期/增长期/热卖期/成熟期/下降期/清库存期）
-3. calculate_product_level - 计算产品等级（S/A/B/C/D）
+1. get_base_daily_sales - 基准销量（最近 N 天平均日销量，双源优先）
+2. new_product_annual_forecast - 新品年预测销量
+3. _map_sales_to_level - 年销量映射产品等级（S/A/B/C/D）
 """
 
-import logging
 from datetime import date, timedelta
-from typing import List, Optional
 
-from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.product import Product
-from app.models.sales import SalesData
-
-logger = logging.getLogger(__name__)
+from app.services.sales_fallback import sum_daily_sales_dual
 
 # 生命周期常量
 LIFECYCLE_LAUNCH = "启动期"       # 新品默认
@@ -42,206 +36,66 @@ LEVEL_FREQUENCY = {
     "D": "P4",
 }
 
-# 新品判定天数
-NEW_PRODUCT_DAYS = 365
+# ── 新品年预测（等级评定）：各生命周期预测销量系数 × 安全系数 ──
+# 预测销量公式（需求文档）：启动期=基准×1.03^(天数÷10) / 增长期=×1.15 / 热卖期=×1.30 / 成熟期=×1.00 / 下降期=×0.70
+# 安全系数：启动期1.0 / 增长期1.15 / 热卖期1.30 / 成熟期1.20 / 下降期1.0
+# 每个阶段 tuple: (预测销量系数, 安全系数)；启动期按 预测系数^(d/10) 逐日累加。
+# 可通过 config_service 的 lifecycle_coeff（JSON）覆盖。
+DEFAULT_LIFECYCLE_COEFF: dict[str, tuple] = {
+    "启动期": (1.03, 1.0),
+    "增长期": (1.15, 1.15),
+    "热卖期": (1.30, 1.30),
+    "成熟期": (1.00, 1.20),
+    "下降期": (0.70, 1.0),
+}
+LIFECYCLE_STAGES_FORECAST = ["启动期", "增长期", "热卖期", "成熟期", "下降期"]
 
 
-async def identify_stage(asin: str, session: AsyncSession) -> str:
-    """判断产品阶段：新品/老品
+async def get_base_daily_sales(session: AsyncSession, asin: str, days: int = 3) -> float | None:
+    """基准销量 = 最近 N 天平均日销量（daily_sales_stats 逐日实抓优先，缺时回退 sales_data）
 
-    上架日期 ≤ 当前日期1年 = 新品，否则 = 老品。
-    如果产品没有上架日期，默认返回"老品"。
-
-    Args:
-        asin: ASIN编码
-        session: 数据库会话
-
-    Returns:
-        "新品" 或 "老品"
-    """
-    result = await session.execute(
-        select(Product.list_date).where(Product.asin == asin)
-    )
-    list_date = result.scalar_one_or_none()
-
-    if not list_date:
-        logger.warning(f"产品 {asin} 无上架日期，默认老品")
-        return "老品"
-
-    days_since_listing = (date.today() - list_date).days
-    return "新品" if days_since_listing <= NEW_PRODUCT_DAYS else "老品"
-
-
-async def identify_lifecycle(product: Product, session: AsyncSession) -> dict:
-    """识别产品生命周期阶段
-
-    新品（上架≤1年）→ 默认"启动期"
-    老品依据：上架时间、近30天/60天销量增长率判断。
-
-    Args:
-        product: Product ORM对象
-        session: 数据库会话
-
-    Returns:
-        dict: {
-            "asin": str,
-            "lifecycle": str,       # 生命周期阶段
-            "stage": str,           # 新品/老品
-            "growth_rate": float,   # 近30天销量增长率
-            "sales_30": int,        # 近30天销量
-            "sales_60": int,        # 30-60天前销量
-            "reason": str,          # 判断理由
-        }
+    近 N 天两源均无销量记录 → 返回 None（无基准，新品等级空着，不计算）。
     """
     today = date.today()
-
-    # 判断新品老品
-    stage = "新品"
-    if product.list_date:
-        days_since_listing = (today - product.list_date).days
-        if days_since_listing > NEW_PRODUCT_DAYS:
-            stage = "老品"
-
-    if stage == "新品":
-        return {
-            "asin": product.asin,
-            "lifecycle": LIFECYCLE_LAUNCH,
-            "stage": "新品",
-            "growth_rate": 0,
-            "sales_30": 0,
-            "sales_60": 0,
-            "reason": "上架≤1年，默认启动期",
-        }
-
-    # 老品：分析近30天 vs 前30天销量增长率
-    thirty_days_ago = today - timedelta(days=30)
-    sixty_days_ago = today - timedelta(days=60)
-
-    # 近30天销量
-    result_30 = await session.execute(
-        select(func.coalesce(func.sum(SalesData.sales_qty), 0)).where(
-            SalesData.asin == product.asin,
-            SalesData.date >= thirty_days_ago,
-            SalesData.date < today,
-        )
-    )
-    sales_30 = result_30.scalar() or 0
-
-    # 30-60天前销量
-    result_60 = await session.execute(
-        select(func.coalesce(func.sum(SalesData.sales_qty), 0)).where(
-            SalesData.asin == product.asin,
-            SalesData.date >= sixty_days_ago,
-            SalesData.date < thirty_days_ago,
-        )
-    )
-    sales_60 = result_60.scalar() or 0
-
-    # 计算增长率
-    growth_rate = 0.0
-    if sales_60 > 0:
-        growth_rate = round((sales_30 - sales_60) / sales_60, 4)
-
-    # 根据增长率判断生命周期
-    if growth_rate >= 0.5:
-        lifecycle = LIFECYCLE_GROWTH
-        reason = f"近30天销量增长率≥50%（{growth_rate:.1%}），快速增长中"
-        if sales_30 > 100:
-            lifecycle = LIFECYCLE_HOT
-            reason = f"近30天销量高且增长率≥50%（{growth_rate:.1%}），热卖中"
-    elif growth_rate >= 0.2:
-        lifecycle = LIFECYCLE_HOT
-        reason = f"近30天销量增长率≥20%（{growth_rate:.1%}），热卖中"
-    elif growth_rate >= -0.2:
-        lifecycle = LIFECYCLE_MATURE
-        reason = f"近30天销量增长率在±20%之间（{growth_rate:.1%}），表现稳定"
-    elif growth_rate >= -0.5:
-        lifecycle = LIFECYCLE_DECLINE
-        reason = f"近30天销量下降20%-50%（{growth_rate:.1%}），需关注"
-    else:
-        lifecycle = LIFECYCLE_CLEARANCE
-        reason = f"近30天销量下降超50%（{growth_rate:.1%}），建议清库存"
-
-    return {
-        "asin": product.asin,
-        "lifecycle": lifecycle,
-        "stage": "老品",
-        "growth_rate": growth_rate,
-        "sales_30": sales_30,
-        "sales_60": sales_60,
-        "reason": reason,
-    }
+    start = today - timedelta(days=days)
+    end = today - timedelta(days=1)
+    # 双源优先：daily_sales_stats（逐日实抓完整数据）优先，无记录才回退 sales_data
+    total = await sum_daily_sales_dual(asin, start, end, session)
+    if total is None or total <= 0:
+        return None
+    return round(total / days, 2)
 
 
-async def calculate_product_level(
-    product: Product,
-    sales_data: Optional[List[SalesData]] = None,
-    session: Optional[AsyncSession] = None,
-    forecast_sales: Optional[int] = None,
-) -> dict:
-    """计算产品等级
+def new_product_annual_forecast(
+    base_daily_sales: float | None,
+    stage_days: dict[str, int] | None,
+    coeffs: dict[str, tuple] | None = None,
+) -> int | None:
+    """新品年预测销量 = 基准(近3天日均) × Σ(各阶段预测销量系数 × 天数 × 安全系数)
 
-    老品按年销量：S(≥5000), A(2000-4999), B(1000-1999), C(300-999), D(1-299)
-    新品按预测销量：forecast_sales 传入预测年销量（不传时默认返回C级）
-
-    Args:
-        product: Product ORM对象
-        sales_data: 当年销量数据列表（可选，老品计算用）
-        session: 数据库会话（当sales_data为None时用于查询）
-        forecast_sales: 新品预测年销量（新品分级依据）
-
-    Returns:
-        dict: {
-            "asin": str,
-            "product_level": str,  # S/A/B/C/D
-            "calc_frequency": str, # P0/P1/P2/P3/P4
-            "total_sales": int,    # 年销量或预测销量
-            "stage": str,          # 新品/老品
-        }
+    仅计算实际生命周期的时间区间阶段天数（缓存表 festival_lifecycle_days）；
+    无有效阶段天数（如非节日新品 / 无基准销量）→ 返回 None（等级空着，不计算）。
+    coeffs: 可选覆盖 {阶段: (预测系数, 安全系数)}，缺省用 DEFAULT_LIFECYCLE_COEFF。
     """
-    today = date.today()
-
-    # 判断新品老品
-    stage = "新品"
-    if product.list_date:
-        days_since_listing = (today - product.list_date).days
-        if days_since_listing > NEW_PRODUCT_DAYS:
-            stage = "老品"
-
-    if stage == "新品":
-        total_sales = forecast_sales if forecast_sales is not None else 0
-        level = _map_sales_to_level(total_sales) if forecast_sales is not None else "C"
-        return {
-            "asin": product.asin,
-            "product_level": level,
-            "calc_frequency": LEVEL_FREQUENCY.get(level, "P4"),
-            "total_sales": total_sales,
-            "stage": "新品",
-            "based_on": "预测销量",
-        }
-
-    # 老品：计算年销量
-    total_sales = 0
-    if sales_data:
-        total_sales = sum(s.sales_qty for s in sales_data)
-    elif session:
-        result = await session.execute(
-            select(func.coalesce(func.sum(SalesData.sales_qty), 0)).where(
-                SalesData.asin == product.asin,
-                func.extract("year", SalesData.date) == today.year,
-            )
-        )
-        total_sales = result.scalar() or 0
-
-    level = _map_sales_to_level(total_sales)
-    return {
-        "asin": product.asin,
-        "product_level": level,
-        "calc_frequency": LEVEL_FREQUENCY.get(level, "P4"),
-        "total_sales": total_sales,
-        "stage": "老品",
-        "based_on": "年销量",
-    }
+    if base_daily_sales is None or base_daily_sales <= 0:
+        return None
+    if not stage_days:
+        return None
+    coeffs = coeffs or DEFAULT_LIFECYCLE_COEFF
+    total = 0.0
+    for stage in LIFECYCLE_STAGES_FORECAST:
+        n = int(stage_days.get(stage, 0) or 0)
+        if n <= 0:
+            continue
+        predict, safety = coeffs.get(stage, (1.0, 1.0))
+        if stage == "启动期":  # 逐日 预测系数^(d/10)
+            stage_mult = sum(predict ** (d / 10.0) for d in range(1, n + 1))
+        else:
+            stage_mult = predict * n
+        total += stage_mult * safety
+    if total <= 0:
+        return None
+    return round(base_daily_sales * total)
 
 
 def _map_sales_to_level(total_sales: int) -> str:

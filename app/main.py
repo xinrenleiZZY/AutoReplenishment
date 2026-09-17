@@ -1,5 +1,6 @@
 """FastAPI 应用入口"""
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,8 +9,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.config import settings
-from app.database import init_db, close_db, engine
+from app.database import init_db, close_db, engine, async_session_factory
 from app.tasks.scheduler import setup_scheduler
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -17,6 +20,14 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     await init_db()
+    try:
+        from app.services.operator_sync import sync_operators_from_products
+
+        async with async_session_factory() as session:
+            stats = await sync_operators_from_products(session)
+        logger.info(f"启动时运营人员同步完成: {stats}")
+    except Exception as e:
+        logger.error(f"启动时运营人员同步失败: {e}")
     scheduler = setup_scheduler()
     scheduler.start()
     yield
@@ -26,9 +37,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="自动补货决策系统",
+    title=settings.APP_NAME,
     description="AI驱动的跨境电商自动补货决策平台",
-    version="1.0.0",
+    version=settings.APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -52,6 +63,7 @@ async def root():
         "env": settings.APP_ENV,
         "docs": "/docs",
         "health": "/health",
+        "app_info": "/api/v1/app-info",
     }
 
 
@@ -89,16 +101,30 @@ from app.api.v1 import (  # noqa: E402
     products,
     sales,
     calculation,
+    analysis,
+    config,
     festival_calendar,
     category_leadtimes,
-    seasonal_curves,
     sync_logs,
+    sync_overview,
+    operators,
+    ai,
+    product_costs,
+    data_source,
+    app_info,
 )
 
 app.include_router(products.router, prefix="/api/v1/products", tags=["产品管理"])
 app.include_router(sales.router, prefix="/api/v1/sales", tags=["销量数据"])
 app.include_router(calculation.router, prefix="/api/v1/calculation", tags=["计算任务"])
+app.include_router(analysis.router, prefix="/api/v1/analysis", tags=["分析报告"])
+app.include_router(config.router, prefix="/api/v1/config", tags=["自定义参数"])
 app.include_router(festival_calendar.router, prefix="/api/v1/festival-calendar", tags=["节日日历"])
 app.include_router(category_leadtimes.router, prefix="/api/v1/category-leadtimes", tags=["分类工期"])
-app.include_router(seasonal_curves.router, prefix="/api/v1/seasonal-curves", tags=["季节曲线"])
 app.include_router(sync_logs.router, prefix="/api/v1/sync-logs", tags=["同步日志"])
+app.include_router(sync_overview.router, prefix="/api/v1/sync-overview", tags=["今日同步数据"])
+app.include_router(operators.router, prefix="/api/v1/operators", tags=["运营人员管理"])
+app.include_router(ai.router, prefix="/api/v1/ai", tags=["AI评估"])
+app.include_router(product_costs.router, prefix="/api/v1/products", tags=["产品成本表"])
+app.include_router(data_source.router, prefix="/api/v1/data-source", tags=["数据来源核验"])
+app.include_router(app_info.router, prefix="/api/v1/app-info", tags=["应用信息"])

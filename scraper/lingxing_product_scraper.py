@@ -33,22 +33,49 @@ def get_auth_token():
     return token
 
 def refresh_and_reload_token() -> bool:
-    """运行 refresh_auth_token.py 重新获取 token"""
-    refresh_script = os.path.join(BASE_DIR, "tools", "refresh_auth_token.py")
-    if not os.path.exists(refresh_script):
-        print("[WARN] refresh_auth_token.py 不存在，无法自动刷新")
-        return False
-    print("[INFO] auth-token 过期，尝试自动刷新...")
+    """运行刷新 token 逻辑：优先调用独立模块 browser_api.lingxing_auth（CDP 自动登录+捕获），
+    失败时回退旧版 refresh_auth_token.py 子进程方式。
+
+    刷新成功后自动重新加载模块内 AUTH_TOKEN / HEADERS。
+    """
+    token = None
     try:
-        result = subprocess.run(["python", refresh_script], cwd=BASE_DIR, capture_output=True, text=True, timeout=30)
-        print(result.stdout)
-        if result.returncode != 0:
-            print(f"[WARN] 刷新失败: {result.stderr[:300]}")
-            return False
-        return True
+        sys.path.insert(0, BASE_DIR)
+        from browser_api.lingxing_auth import LingxingAuth
+        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
+        auth = LingxingAuth(cdp_port=cdp_port)
+        # ensure_token: 未登录则自动登录（含二次认证），再跳转listing捕获 token
+        token = auth.ensure_token()
     except Exception as e:
-        print(f"[WARN] 刷新异常: {e}")
-        return False
+        print(f"[WARN] 独立模块刷新 token 失败({e})，回退旧方式")
+        token = None
+
+    if not token:
+        # 旧版：子进程方式（仅捕获，不自动登录）
+        refresh_script = os.path.join(BASE_DIR, "tools", "refresh_auth_token.py")
+        if not os.path.exists(refresh_script):
+            print("[WARN] refresh_auth_token.py 不存在，无法自动刷新")
+            return False
+        print("[INFO] auth-token 过期，尝试自动刷新...")
+        try:
+            result = subprocess.run(["python", refresh_script], cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
+            print(result.stdout)
+            if result.returncode != 0:
+                print(f"[WARN] 刷新失败: {result.stderr[:300]}")
+                return False
+            import re as _re
+            m = _re.search(r"TOKEN_OK=(.+)", result.stdout or "")
+            token = m.group(1) if m else None
+        except Exception as e:
+            print(f"[WARN] 刷新异常: {e}")
+            return False
+
+    if token:
+        global AUTH_TOKEN
+        AUTH_TOKEN = token
+        HEADERS["auth-token"] = AUTH_TOKEN
+        return True
+    return False
 
 AUTH_TOKEN = get_auth_token()
 
@@ -86,7 +113,7 @@ HEADERS = {
 
 
 
-def fetch_page(offset: int, req_seq: int) -> dict:
+def fetch_page(offset: int, req_seq: int, begin_date: str = "", end_date: str = "") -> dict:
     payload = {
         "offset": offset,
         "length": PER_PAGE,
@@ -100,20 +127,42 @@ def fetch_page(offset: int, req_seq: int) -> dict:
         "global_tag_ids": "",
         "req_time_sequence": f"/listing-api/api/product/showOnline$${req_seq}",
     }
+    # 按创建时间区间过滤（服务端参数；部分环境可能不支持，scrape_all 会回退）
+    if begin_date:
+        payload["begin_date"] = begin_date
+    if end_date:
+        payload["end_date"] = end_date
     resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+    try:
+        from app.services.raw_store import collect_raw
+
+        collect_raw("showOnline_scraper", data, url=API_URL, method="POST",
+                    params=payload, status_code=resp.status_code)
+    except Exception:  # noqa: BLE001
+        pass
     if data.get("code") != 1:
         raise Exception(f"API error: code={data.get('code')}, msg={data.get('msg')}")
     return data.get("data", {})
 
 
-def scrape_all():
+def scrape_all(begin_date: str = "", end_date: str = ""):
     os.makedirs(P_ID_DIR, exist_ok=True)
 
     # 第一页，获取 total（鉴权失败时自动刷新 token 重试）
+    requested_dates = bool(begin_date and end_date)
+    effective_begin, effective_end = begin_date, end_date
     try:
-        first = fetch_page(0, 1)
+        try:
+            first = fetch_page(0, 1, effective_begin, effective_end)
+        except Exception as e:
+            if requested_dates:
+                print(f"[WARN] 服务端按创建时间过滤失败({e})，回退全量抓取+客户端过滤")
+                effective_begin, effective_end = "", ""
+                first = fetch_page(0, 1)
+            else:
+                raise
     except Exception as e:
         err = str(e)
         if "8003" in err or "鉴权" in err:
@@ -121,7 +170,11 @@ def scrape_all():
                 global AUTH_TOKEN
                 AUTH_TOKEN = get_auth_token()
                 HEADERS["auth-token"] = AUTH_TOKEN
-                first = fetch_page(0, 1)
+                try:
+                    first = fetch_page(0, 1, effective_begin, effective_end)
+                except Exception:
+                    effective_begin, effective_end = "", ""
+                    first = fetch_page(0, 1)
             else:
                 raise
         else:
@@ -147,7 +200,7 @@ def scrape_all():
             offset = page * PER_PAGE
             seq += 1
             try:
-                data = fetch_page(offset, seq)
+                data = fetch_page(offset, seq, effective_begin, effective_end)
                 items = data.get("list", [])
                 for item in items:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")

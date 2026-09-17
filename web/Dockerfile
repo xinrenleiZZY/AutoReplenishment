@@ -1,5 +1,5 @@
 # 前端镜像（Next.js standalone 多阶段构建）
-FROM node:22-alpine AS base
+FROM node:24-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS base
 ENV NEXT_TELEMETRY_DISABLED=1
 
 # 依赖阶段：使用锁文件 + npm ci，保证可复现构建
@@ -7,7 +7,7 @@ FROM base AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+    npm ci --registry=https://registry.npmmirror.com
 
 # 构建阶段
 FROM base AS builder

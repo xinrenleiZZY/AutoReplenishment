@@ -206,7 +206,22 @@ def get_client(server_name: str) -> MCPClient:
 
 def mcp_call(server: str, tool: str, params: dict = None):
     """便捷调用 MCP 工具"""
-    return get_client(server).call(tool, params)
+    client = get_client(server)
+    result = client.call(tool, params)
+    # 完整原始响应归档入库（线程安全收集，任务末尾 flush_raw 落库）
+    try:
+        from app.services.raw_store import collect_raw
+
+        asin = None
+        if isinstance(params, dict):
+            asin = params.get("asin")
+            if not asin and isinstance(params.get("asins"), list) and params.get("asins"):
+                asin = params["asins"][0]
+        collect_raw(f"{server}/{tool}", result, asin=asin, url=getattr(client, "url", None),
+                    method="POST", params=params)
+    except Exception:  # noqa: BLE001
+        pass
+    return result
 
 
 def list_tools(server: str):

@@ -106,6 +106,13 @@ def fetch_tags(bind_detail: list, req_seq: int) -> list:
     resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+    try:
+        from app.services.raw_store import collect_raw
+
+        collect_raw("getRelationTagList", data, url=API_URL, method="POST",
+                    params=payload, status_code=resp.status_code)
+    except Exception:  # noqa: BLE001
+        pass
     if data.get("code") != 1:
         raise Exception(f"API error: code={data.get('code')}, msg={data.get('msg')}")
     raw = data.get("data")

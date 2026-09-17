@@ -16,6 +16,7 @@ class FestivalCalendar(Base):
     listing_start: Mapped[datetime | None] = mapped_column(DateTime, comment="亚马逊预计上架开卖时间")
     festival_date: Mapped[datetime | None] = mapped_column(DateTime, comment="节日/主题时间")
     festival_end: Mapped[datetime | None] = mapped_column(DateTime, comment="预设节日/主题结束时间")
+    festival_periods: Mapped[str | None] = mapped_column(Text, comment="节日/主题时间段JSON：[{start,end,label}]，支持一个或多个时间段")
     hot_period: Mapped[str | None] = mapped_column(String(50), comment="热卖期（如 11-12月）")
     hot_start_month: Mapped[int | None] = mapped_column(Integer, comment="热卖开始月份")
     hot_end_month: Mapped[int | None] = mapped_column(Integer, comment="热卖结束月份")

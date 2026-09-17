@@ -11,8 +11,13 @@ alembic==1.14.0
 pandas==2.2.3
 numpy==2.2.1
 
+# 日报可视化大屏图片生成
+matplotlib==3.9.4
+
 # HTTP客户端
 httpx==0.28.1
+requests==2.32.3
+openpyxl==3.1.5
 
 # 定时任务
 apscheduler==3.10.4
@@ -24,6 +29,9 @@ pydantic-settings==2.7.0
 # 工具
 python-dotenv==1.0.1
 python-multipart==0.0.19
+
+# 浏览器自动化（CDP 连接已启动的浏览器，鉴权失败时自动刷新领星登录态）
+playwright==1.49.1
 
 # 测试
 pytest==8.3.4

@@ -9,7 +9,9 @@
 import asyncio
 import sys
 
-sys.path.insert(0, r"e:\ZY2026\yy021-自动补货决策系统")
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import select
 from app.database import async_session_factory
