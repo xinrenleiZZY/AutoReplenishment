@@ -787,12 +787,57 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         inventory["thirty_volume"] = _safe_int(product.thirty_volume)
     if not inventory.get("average_thirty_volume") and getattr(product, "average_thirty_volume", None):
         inventory["average_thirty_volume"] = _safe_float(product.average_thirty_volume)
-    # 口径可追溯：判断依据里写明本次实际使用的公式（系统公式 / 领星兜底 / 物流实时库 / 估算）
+    # ── 老品库存天数唯一口径：窗口「各月预估 ÷ 该月天数 → 按库存坐落月逐月扣减」 ──
+    #    必须早于 Step 6 记录：Step 6/7/结果表展示的库存天数为同一口径结果（_old_product_inventory_days）；
+    #    节日窗口优先，其次长期产品窗口；去年同窗口无销量（无各月占比）→ 留空（None）。
+    #    新品不参与（走 _run_new_product_flow 的新品口径）。
+    festival_window = None
+    if not is_new_product:
+        festival_window = await _calc_festival_window(product, session, inventory)
+        if festival_window:
+            inventory["festival_window"] = festival_window
+            inventory["last_year_thirty_volume"] = festival_window.get("last_year_30d") or 0
+            if (festival_window.get("this_year_30d") or 0) > 0:
+                # 评分 G 与窗口预估同口径：近30天销量统一取 SalesData 日明细
+                inventory["thirty_volume"] = festival_window["this_year_30d"]
+
+        # 老品-长期产品：把 Step 4 的「各月占比」+ Step 5 的「当月预测销量」透传给 Step 9/15
+        # 采购批次规划（Q8：由 AI 为最终需采购的产品分割批次）
+        if history.get("lt_monthly_sales"):
+            lt_win = {
+                "window_start": history.get("lt_window_start"),
+                "window_end": history.get("lt_window_end"),
+                "base_total": history.get("lt_base_total"),
+                "trend_coeff": history.get("lt_trend_coeff"),
+                "monthly_sales": history.get("lt_monthly_sales"),
+                "monthly_forecast": forecast.get("forecast_months"),
+            }
+            # 库存天数与节日老品同口径：各月预估 ÷ 该月天数 → 按库存坐落月逐月扣减
+            if lt_win["window_start"] and lt_win["window_end"]:
+                _lt_cov = _window_coverage(inventory, lt_win, lt_win["window_start"], lt_win["window_end"])
+                lt_win.update({
+                    "coverage_days": _lt_cov["days"],
+                    "coverage_until": _lt_cov["until"],
+                    "coverage_months": _lt_cov["months"],
+                    "coverage_demand_total": _lt_cov["demand_total"],
+                })
+            inventory["long_term_window"] = lt_win
+
+        # 老品库存天数统一落值（无窗口时保持 _analyze_inventory 的领星/系统兜底，本轮不处理）
+        _old_cov = _old_product_inventory_days(inventory, festival_window)
+        if _old_cov["source"] == "window":
+            inventory["inventory_days"] = _old_cov["days"]
+            inventory["inventory_days_source"] = "window"
+            inventory["inventory_days_formula"] = _old_cov["formula"]
+
+    # 口径可追溯：判断依据里写明本次实际使用的公式（窗口逐月扣减 / 领星兜底 / 系统公式）
     _b6_days_formula = inventory.get("inventory_days_formula") or "系统公式"
+    _b6_kind = ("窗口各月占比逐月扣减" if inventory.get("inventory_days_source") == "window"
+                else ("领星(数据过少兜底)" if inventory.get("lx_used") else "系统公式"))
     _b6_arrival_formula = inventory.get("inbound_arrival_formula") or "无在途（FBA在途+采购待到货=0），不计算上架日"
     _b6_reason = "\n".join([
         f"可用库存={inventory.get('available_stock')}, 覆盖天数={inventory.get('inventory_days')}, "
-        f"口径={'领星' if inventory.get('lx_used') else '系统公式'}",
+        f"口径={_b6_kind}",
         f"可用库存公式：{inventory.get('available_stock_formula') or '—'}",
         f"覆盖天数公式：{_b6_days_formula}",
         f"在途预计上架日公式：{_b6_arrival_formula}",
@@ -802,7 +847,7 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         "fba_available": inventory.get("fba_available"),
         "inventory_days": inventory.get("inventory_days"),
         "replenishment_cycle": inventory.get("replenishment_cycle"),
-        "口径": "领星(数据过少兜底)" if inventory.get("lx_used") else "系统公式",
+        "口径": _b6_kind,
         "覆盖天数口径": _b6_days_formula,
         "可用库存口径": inventory.get("available_stock_formula"),
         "销量数据天数": inventory.get("data_days"),
@@ -839,39 +884,8 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{asin}] 新品六维评分计算失败: {e}")
     else:
-        # ── 老品节日产品：提前计算节日窗口同期增长预估（T1-1~5） ──
-        #    用于：① 触发判断（_calc_purchase_trigger 窗口缺口触发）
-        #         ② 建议量（_calc_suggested_qty_v2 窗口剩余需求）
-        #         ③ 评分 G（_calc_score 近30天同比）
-        festival_window = await _calc_festival_window(product, session, inventory)
-        if festival_window:
-            inventory["festival_window"] = festival_window
-            inventory["last_year_thirty_volume"] = festival_window.get("last_year_30d") or 0
-            if (festival_window.get("this_year_30d") or 0) > 0:
-                # 评分 G 与窗口预估同口径：近30天销量统一取 SalesData 日明细
-                inventory["thirty_volume"] = festival_window["this_year_30d"]
-
-        # 老品-长期产品：把 Step 4 的「各月占比」+ Step 5 的「当月预测销量」透传给 Step 9/15
-        # 采购批次规划（Q8：由 AI 为最终需采购的产品分割批次）
-        if history.get("lt_monthly_sales"):
-            lt_win = {
-                "window_start": history.get("lt_window_start"),
-                "window_end": history.get("lt_window_end"),
-                "base_total": history.get("lt_base_total"),
-                "trend_coeff": history.get("lt_trend_coeff"),
-                "monthly_sales": history.get("lt_monthly_sales"),
-                "monthly_forecast": forecast.get("forecast_months"),
-            }
-            # 库存天数与节日老品同口径：各月预估 ÷ 该月天数 → 按库存坐落月逐月扣减
-            if lt_win["window_start"] and lt_win["window_end"]:
-                _lt_cov = _window_coverage(inventory, lt_win, lt_win["window_start"], lt_win["window_end"])
-                lt_win.update({
-                    "coverage_days": _lt_cov["days"],
-                    "coverage_until": _lt_cov["until"],
-                    "coverage_months": _lt_cov["months"],
-                    "coverage_demand_total": _lt_cov["demand_total"],
-                })
-            inventory["long_term_window"] = lt_win
+        # ── 老品：节日窗口 / 长期窗口与库存天数已在 Step 6 之前按唯一口径算好 ──
+        #    （见 _old_product_inventory_days：各月占比逐月扣减），此处仅消费，不再重算。
 
         # ── Step 7: 计算采购触发（结合时间轴） ──
         # 老品节日产品：窗口逻辑覆盖时间轴门禁（T1-9）——当窗口剩余需求>0 且空运仍能赶上热卖月时，
@@ -4004,6 +4018,59 @@ def _window_coverage(inventory: dict, window: dict, win_start: date, win_end: da
     }
 
 
+def _old_product_inventory_days(inventory: dict, festival_window: dict | None = None) -> dict:
+    """老品库存天数唯一口径：窗口「各月预估 ÷ 该月天数 → 按库存坐落月逐月扣减」
+
+    数据源 = _window_coverage（节日窗口优先，其次长期产品窗口）：
+      - 有各月占比 → days = 覆盖天数（上限365），formula 写明各月日均与覆盖截止日；
+      - 去年同窗口无销量（无各月占比）→ days = None（库存天数留空）；
+      - 无任何窗口（老品无节日且非长期，本轮不处理）→ days = None 且 source = "none"
+        （调用方沿用领星/系统兜底，不改动这部分行为）。
+
+    返回 {"days": int|None, "source": "window"|"none", "formula": str}
+    """
+    cov_days = None
+    cov_months: list = []
+    cov_until = None
+    demand_total = 0
+    src = ""
+    window_label = ""
+    if festival_window:
+        src = "节日窗口"
+        cov_days = festival_window.get("coverage_days")
+        cov_months = festival_window.get("coverage_months") or []
+        cov_until = festival_window.get("coverage_until")
+        demand_total = festival_window.get("coverage_demand_total") or 0
+        _wm = festival_window.get("window_months") or []
+        window_label = (f"{_wm[0]}~{_wm[-1]}月" if _wm
+                        else f"{festival_window.get('win_start')}~{festival_window.get('win_end')}")
+    else:
+        lt = inventory.get("long_term_window") or {}
+        if lt:
+            src = "长期窗口"
+            cov_days = lt.get("coverage_days")
+            cov_months = lt.get("coverage_months") or []
+            cov_until = lt.get("coverage_until")
+            demand_total = lt.get("coverage_demand_total") or 0
+            window_label = f"{lt.get('window_start')}~{lt.get('window_end')}"
+    if not src:
+        return {"days": None, "source": "none",
+                "formula": "无窗口（老品库存天数仅按窗口各月占比逐月扣减口径，本轮不处理无节日且非长期产品）"}
+    if cov_days is None:
+        return {"days": None, "source": "window",
+                "formula": f"{src}[{window_label}]去年同窗口无销量（无各月占比）→ 库存天数不计算（留空）"}
+    days = min(int(cov_days), 365)
+    daily_desc = "、".join(
+        f"{str(r.get('月'))[5:]}月{r.get('该月日均')}件/天" for r in cov_months
+    ) or "(窗口口径)"
+    return {
+        "days": days,
+        "source": "window",
+        "formula": (f"{src}[{window_label}]预估总需求{demand_total}，各月日均{daily_desc}，"
+                    f"自窗口首日起逐月扣减可用库存，可售至{cov_until or '窗口内'}共{days}天"),
+    }
+
+
 async def _calc_festival_window(product: Product, session: AsyncSession, inventory: dict) -> dict | None:
     """老品节日产品：节日窗口预估（与 Step 4/5 统一口径，Q4）
 
@@ -4309,19 +4376,28 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
         daily_sales = base_daily
         daily_desc = "(领星口径)"
     else:
-        # 库存天数唯一口径 = 窗口（节日 / 长期产品）「各月预估 ÷ 该月天数 → 逐月扣减库存」，
-        # 由下方「节日窗口」「长期窗口」分支计算；此处不使用任何日均口径。
-        # 无窗口各月占比（去年同窗口无销量）→ 不计算，库存天数留空（None）。
+        # 库存天数不使用任何日均口径，统一由下方「唯一口径」落值
         base_daily = recent_3_days_avg or average_thirty_volume or (thirty_volume / 30 if thirty_volume > 0 else 0)
         daily_sales = 0
         inventory_days = None
         daily_desc = "(老品库存天数仅按窗口各月占比逐月扣减口径)"
+
+    # ── 库存天数唯一口径（与 Step 6 同源）：窗口「各月预估 ÷ 该月天数 → 逐月扣减」──
+    #    有窗口（节日优先 / 长期产品）→ 覆盖天数；无各月占比 → 留空（None）；
+    #    无窗口（老品无节日且非长期，本轮不处理）→ 保持 None，不另立口径。
+    _cov = _old_product_inventory_days(inventory, inventory.get("festival_window"))
+    if _cov["source"] == "window":
+        inventory_days = _cov["days"]
+        daily_desc = ""
 
     # 库存天数上限：与库存分析一致，防止失真大值（如21111天）污染积压提醒
     if inventory_days is not None:
         inventory_days = min(inventory_days, 365)
     # 更新库存覆盖天数
     inventory["inventory_days"] = inventory_days
+    if _cov["source"] == "window":
+        inventory["inventory_days_source"] = "window"
+        inventory["inventory_days_formula"] = _cov["formula"]
 
     # 断货兜底：可用库存=0 且无有效库存天数（无销量/无领星可售天数）→ 视为0天触发采购
     # 仅当存在实际需求（近3天/30天销量或未来预测>0）；无需求产品（0销量0预测）不触发，
@@ -4357,29 +4433,16 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
         window_label = f"{window_months[0]}~{window_months[-1]}月" if window_months else "?"
         hot_end = int(festival_window.get("hot_end_month") or 0)
         if remaining > 0:
-            # 库存天数 = 按「窗口各月预估 ÷ 该月天数 → 逐月扣减可用库存」（_window_coverage）得出，
-            # 反映库存坐落在哪个年月、能卖到哪天；无各月占比 → 不计算，库存天数留空。
+            # 库存天数 = 统一口径结果（_old_product_inventory_days，与 Step 6 同源）：
+            # 「窗口各月预估 ÷ 该月天数 → 逐月扣减可用库存」，反映库存坐落在哪个月、能卖到哪天；
+            # 无各月占比 → 留空（None）。
             est = festival_window.get("window_estimate") or 0
             sold = festival_window.get("sold_in_window") or 0
             stock = int(inventory.get("available_stock") or 0)
-            cov_days = festival_window.get("coverage_days")
-            cov_months = festival_window.get("coverage_months") or []
-            if cov_days is not None:
-                inventory_days = min(int(cov_days), 365)
-                inventory["inventory_days"] = inventory_days
-                daily_desc = "、".join(
-                    f"{str(r.get('月'))[5:]}月{r.get('该月日均')}件/天" for r in cov_months
-                ) or "(窗口口径)"
-                reason = (f"节日窗口[{window_label}]预估总需求{est}（{int((festival_window.get('g') or 0)*100)}%同期增长），"
-                          f"已售{sold}＋库存{stock}＋在途缺口{remaining}；按各月占比逐月扣减（{daily_desc}），"
-                          f"库存可售至{festival_window.get('coverage_until') or '窗口内'}共{inventory_days}天，需提前补货")
-            else:
-                # 去年同窗口无销量（无各月占比）→ 统一口径：不计算，库存天数留空
-                inventory_days = None
-                inventory["inventory_days"] = None
-                reason = (f"节日窗口[{window_label}]预估总需求{est}（{int((festival_window.get('g') or 0)*100)}%同期增长），"
-                          f"已售{sold}＋库存{stock}＋在途缺口{remaining}；"
-                          f"去年同窗口无各月占比，库存天数不计算，需提前补货")
+            inventory_days = _cov["days"]
+            inventory["inventory_days"] = inventory_days
+            reason = (f"节日窗口[{window_label}]预估总需求{est}（{int((festival_window.get('g') or 0)*100)}%同期增长），"
+                      f"已售{sold}＋库存{stock}＋在途缺口{remaining}；{_cov['formula']}，需提前补货")
             recommended = "海运"
             if hot_end and hot_end > date.today().month and hot_end - date.today().month <= 2:
                 recommended = "空派"  # 热卖月临近，海运恐赶不上，需空派保热卖
@@ -4404,30 +4467,9 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
 
     # ── 老品长期产品：与节日老品同口径（窗口各月占比逐月扣减） ──
     #    [明天, 当前月+2 月末] 各月预估 = 去年该月 × 趋势系数，÷ 该月天数 → 逐月扣减可用库存；
-    #    库存天数 = 覆盖天数，再走下方统一触发判断（> 补货周期 → 无需采购）。
+    #    库存天数 = 覆盖天数（已在 _cov 落值），再走下方统一触发判断（> 补货周期 → 无需采购）。
     #    无各月占比（去年同窗口无销量）→ 不计算，库存天数留空（None）。
-    long_term_window = inventory.get("long_term_window")
-    window_note = ""
-    if long_term_window:
-        lt_start = long_term_window.get("window_start")
-        lt_end = long_term_window.get("window_end")
-        window_label = f"{lt_start}~{lt_end}" if (lt_start and lt_end) else "?"
-        lt_est = long_term_window.get("coverage_demand_total") or 0
-        cov_days = long_term_window.get("coverage_days")
-        if cov_days is None:
-            inventory_days = None
-            inventory["inventory_days"] = None
-            window_note = (f"长期窗口[{window_label}]无各月占比（去年同窗口无销量），库存天数不计算；"
-                           f"窗口预估总需求{lt_est}")
-        else:
-            inventory_days = min(int(cov_days), 365)
-            inventory["inventory_days"] = inventory_days
-            daily_desc = "、".join(
-                f"{str(r.get('月'))[5:]}月{r.get('该月日均')}件/天"
-                for r in (long_term_window.get("coverage_months") or [])
-            ) or "(窗口口径)"
-            window_note = (f"长期窗口[{window_label}]预估总需求{lt_est}，按各月占比逐月扣减（{daily_desc}），"
-                           f"库存可售至{long_term_window.get('coverage_until') or '窗口内'}共{inventory_days}天")
+    window_note = _cov["formula"] if _cov["source"] == "window" else ""
 
     # 触发条件：库存覆盖天数 ≤ 海运补货周期(+安全库存)；等于周期时也触发（否则到货即售罄，无缓冲）
     safe_days = int(settings.SAFE_STOCK_DAYS or 0)
