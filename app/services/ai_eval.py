@@ -330,45 +330,33 @@ async def evaluate_purchase(asin: str, session: AsyncSession) -> dict:
             _ly30_value = _fb_ly30
             logger.info(f"[{asin}] 去年近30天({_ly30_start}~{_ly30_end})兜底 daily_sales_stats: {_fb_ly30}")
 
-    # ── 节日窗口口径（AI 判断节日产品库存覆盖的正确基准） ──
+    # ── 节日窗口口径：直接读系统最新计算结果（唯一口径：窗口各月占比逐月扣减），不再本地复算 ──
     festival_info = None
     if getattr(product, "festival", None):
-        try:
-            from app.tasks.calculation_tasks import _analyze_inventory, _calc_festival_window
-            _inv = await _analyze_inventory(asin, session)
-            _fw = await _calc_festival_window(product, session, _inv)
-            if _fw:
-                _ws = _fw.get("win_start")
-                _we = _fw.get("win_end")
-                # 与 _calc_festival_window 口径一致：窗口天数 = 今年窗口（明天→节日结束）的日历天数
-                _wd = int(_fw.get("window_days") or 0)
-                if _wd <= 0:
-                    _wd = ((_we - _ws).days + 1) if (_ws and _we) else None
-                _avail = int(_inv.get("available_stock") or 0)
-                _est = _fw.get("window_estimate") or 0
-                _daily = (_est / _wd) if (_wd and _est > 0) else 0
-                # 库存覆盖天数：优先用「预估总量 × 各月占比 → 每月 ÷ 该月天数」逐月扣减结果
-                _cov = _fw.get("coverage_days")
-                if _cov is None:
-                    _cov = round(_avail / _daily) if _daily > 0 else None
-                festival_info = {
-                    "节日": product.festival,
-                    "窗口月份": _fw.get("window_months"),
-                    "窗口预估总需求": _est,
-                    "窗口内已售": _fw.get("sold_in_window"),
-                    "剩余缺口": _fw.get("remaining"),
-                    "窗口起始": _ws.isoformat() if _ws else None,
-                    "窗口结束": _we.isoformat() if _we else None,
-                    "窗口天数": _wd,
-                    "窗口日均需求": round(_daily, 1) if _daily else None,
-                    "当前可用库存": _avail,
-                    "窗口口径库存覆盖天数": _cov,
-                    "库存覆盖截止日": _fw.get("coverage_until"),
-                    "库存覆盖逐月明细": _fw.get("coverage_months"),
-                    "系统最新计算库存天数": latest.inventory_days if latest else None,
-                }
-        except Exception as _e:
-            logger.warning(f"[{asin}] 节日窗口口径数据获取失败: {_e}")
+        # Step 7 采购触发判断：系统已按「窗口各月预估 ÷ 该月天数 → 逐月扣减可用库存」算出库存天数
+        _step7 = (await session.execute(
+            select(CalculationStepResult)
+            .where(CalculationStepResult.asin == asin, CalculationStepResult.step_no == 7)
+            .order_by(CalculationStepResult.calc_date.desc(), CalculationStepResult.id.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        _s7_out = {}
+        if _step7 and _step7.output_data:
+            try:
+                _s7_out = json.loads(_step7.output_data)
+            except (json.JSONDecodeError, TypeError):
+                _s7_out = {}
+        festival_info = {
+            "节日": product.festival,
+            "系统最新计算库存天数": latest.inventory_days if latest else None,
+            "系统最新触发": latest.purchase_trigger if latest else None,
+            "系统最新可用库存": latest.available_stock if latest else None,
+            "系统最新补货周期": latest.replenishment_cycle if latest else None,
+            "Step7库存天数": _s7_out.get("inventory_days"),
+            "Step7补货周期": _s7_out.get("replenishment_cycle"),
+            "Step7建议运输方式": _s7_out.get("recommended_transport"),
+            "Step7判断依据": _step7.reason if _step7 else None,
+        }
 
     input_data = {
         "asin": asin,
@@ -458,12 +446,15 @@ async def evaluate_purchase(asin: str, session: AsyncSession) -> dict:
     )
     if festival_info:
         system += (
-            "【重要：节日/季节性产品专用口径】本产品为节日产品，系统计算的【最新计算.库存天数】是按历史同期"
-            "节日窗口日均推算的权威库存覆盖天数，请以此为准判断断货风险与补货需求。"
+            "【重要：节日/季节性产品专用口径】本产品为节日产品，【最新计算.库存天数】与"
+            "【节日窗口口径.系统最新计算库存天数】是系统按「节日窗口各月占比 → 每月÷该月天数 → "
+            "逐月扣减可用库存」算出的权威库存覆盖天数（口径唯一，已落库），请直接采信，不要自行复算。"
             "禁止用近30天日均重新计算库存覆盖天数或据此判断断货——节日产品旺季需求集中，"
-            "即使近30天日均显示库存充足，只要【节日窗口口径.剩余缺口】>0 或【窗口口径库存覆盖天数】不足，"
-            "就必须提示需提前补货；请结合节日窗口口径数据说明，避免出现\"库存充足/无断货风险\""
-            "等与窗口口径矛盾的说法。"
+            "即使近30天日均显示库存充足，只要【节日窗口口径.Step7判断依据】显示窗口仍有缺口"
+            "或库存天数不足，就必须提示需提前补货；请结合节日窗口口径数据说明，"
+            "避免出现\"库存充足/无断货风险\"等与窗口口径矛盾的说法。"
+            "若【系统最新计算库存天数】为空，表示去年同窗口无销量（无各月占比），"
+            "库存天数按口径不计算，请勿臆造天数。"
         )
     user = json.dumps(input_data, ensure_ascii=False)
 

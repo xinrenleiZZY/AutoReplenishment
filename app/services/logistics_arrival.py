@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 # 按天缓存：{ASIN: 最早到货时间(YYYY-MM-DD)}
 _cache: dict[str, str] | None = None
 _cache_date: date | None = None
+# 最近一次拉取失败原因（供调用方在判断依据里写明"是接口异常"还是"确实无记录"）
+_last_error: str | None = None
 
 
 async def _fetch_arrival_map() -> dict[str, str]:
@@ -55,17 +57,23 @@ async def get_arrival_map(force: bool = False) -> dict[str, str]:
     force=True 强制刷新（不常用）；接口失败时返回上次缓存或空映射。
     成功响应（含空结果）同样按天缓存，避免每个 ASIN 重复请求。
     """
-    global _cache, _cache_date
+    global _cache, _cache_date, _last_error
     today = date.today()
     if not force and _cache is not None and _cache_date == today:
         return _cache
     try:
         mapping = await _fetch_arrival_map()
     except Exception as e:  # noqa: BLE001
+        _last_error = str(e)
         logger.warning(f"物流到货接口请求失败，回退缓存: {e}")
         return _cache or {}
-    _cache, _cache_date = mapping, today
+    _cache, _cache_date, _last_error = mapping, today, None
     return mapping
+
+
+def get_last_error() -> str | None:
+    """最近一次拉取物流到货接口的失败原因；成功或无请求时为 None"""
+    return _last_error
 
 
 async def get_inbound_arrival_date(asin: str) -> str | None:
