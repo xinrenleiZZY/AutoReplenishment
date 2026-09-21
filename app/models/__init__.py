@@ -22,6 +22,7 @@ from app.models.profit_report_stat import ProfitReportStat
 from app.models.purchase_plan import PurchasePlan
 from app.models.purchase_plan_items import PurchasePlanItem
 from app.models.purchase_order_board import PurchaseOrderBoard
+from app.models.semantic_classification import SemanticClassification
 
 __all__ = [
     "Product",
@@ -50,4 +51,5 @@ __all__ = [
     "PurchasePlan",
     "PurchasePlanItem",
     "PurchaseOrderBoard",
+    "SemanticClassification",
 ]

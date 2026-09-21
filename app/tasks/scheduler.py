@@ -366,6 +366,22 @@ async def refresh_asin_list_if_pending():
         await session.close()
 
 
+async def roll_festival_years_task():
+    """节日日历年份自更新：每年 12-31 23:59 三日期字段年份 +1"""
+    from app.services.config_service import get_param, set_param
+    from app.services.festival_year_roll import BASE_YEAR_PARAM, roll_festival_years
+
+    session = async_session_factory()
+    try:
+        base = int(await get_param(session, BASE_YEAR_PARAM) or 0)
+        await roll_festival_years(session, 1)
+        await set_param(session, BASE_YEAR_PARAM, (base or date.today().year) + 1)
+    except Exception as e:  # noqa: BLE001
+        logger.error("节日日历年份自更新失败: %s", e)
+    finally:
+        await session.close()
+
+
 def setup_scheduler() -> AsyncIOScheduler:
     """设置定时任务调度器"""
     scheduler = AsyncIOScheduler()
@@ -440,6 +456,15 @@ def setup_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(minute="*/10"),
         id="refresh_asin_list",
         name="ASIN列表刷新(每10分钟)",
+        replace_existing=True,
+    )
+
+    # 节日日历年更新：每年 12-31 23:59 三日期字段年份 +1（启动时另有漏跑兜底）
+    scheduler.add_job(
+        roll_festival_years_task,
+        trigger=CronTrigger(month=12, day=31, hour=23, minute=59),
+        id="roll_festival_years",
+        name="节日日历年更新(每年12-31)",
         replace_existing=True,
     )
 

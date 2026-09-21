@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.festival_calendar import FestivalCalendar
 from app.models.product import Product
 from app.config import settings
+from app.services.semantic_classify import buffer_days, get_semantic_classification
 
 logger = logging.getLogger(__name__)
 
@@ -322,19 +323,17 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
         }
     lead_time = product.lead_time or 30
 
-    # 判断产品类型以确定售卖截止日
-    is_decoration = (product.sub_category or "").strip() in ("装饰品",)
+    # 判断产品类型以确定售卖截止日（语义分类：装饰品/非装饰品，取自 semantic_classifications 表）
+    semantic = await get_semantic_classification(session, product.asin)
+    is_decoration = (semantic or "").strip() == "装饰品"
 
     # 运输时间
     sea_days = settings.SEA_PEAK_DAYS if is_decoration else settings.SEA_SLOW_DAYS
     air_days = settings.AIR_PEAK_DAYS
     express_days = settings.EXPRESS_PEAK_DAYS
 
-    # 装饰品：节前14天，非装饰品：节前3天（需求文档第六章）
-    if is_decoration:
-        selling_end_days_before = 14
-    else:
-        selling_end_days_before = 3
+    # 缓存天数判定：装饰品=14，非装饰品=3
+    selling_end_days_before = buffer_days(semantic)
     selling_end_date = festival_date - timedelta(days=selling_end_days_before)
 
     # 计算各运输方式的最晚采购日期（结果统一再提前 PURCHASE_BUFFER_DAYS 天作为缓冲）

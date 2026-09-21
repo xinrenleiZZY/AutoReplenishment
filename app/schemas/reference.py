@@ -68,6 +68,20 @@ class CategoryLeadtimeResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class SemanticClassificationResponse(BaseModel):
+    asin: str
+    listing_title: str | None = None
+    semantic_classification: str | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class SemanticClassificationPage(BaseModel):
+    total: int
+    items: list[SemanticClassificationResponse]
+
+
 class SyncLogResponse(BaseModel):
     id: int
     sync_type: str

@@ -51,11 +51,16 @@ async def refresh_foundation(session: AsyncSession, write: bool = True) -> dict:
             lifecycle_updated += 1
     if write:
         await session.commit()
-    logger.info("基础数据刷新完成: levels=%s festivals=%s lifecycle_updated=%s",
-                level_stats, fest_stats, lifecycle_updated)
+    # 4) 语义分类（AI 判定装饰品/非装饰品，供缓存天数使用）
+    from app.services.semantic_classify import refresh_semantic_classifications
+
+    semantic_stats = await refresh_semantic_classifications(session, write=write)
+    logger.info("基础数据刷新完成: levels=%s festivals=%s lifecycle_updated=%s semantic=%s",
+                level_stats, fest_stats, lifecycle_updated, semantic_stats)
     return {
         "total": len(products),
         "levels": level_stats,
         "festivals": fest_stats,
         "lifecycle_updated": lifecycle_updated,
+        "semantic": semantic_stats,
     }

@@ -13,7 +13,8 @@ type NavEntry = { type: "link"; href: string; label: string; icon: string }
 /** ASIN列表页面归属「产品管理」分组（分组高亮/默认展开用） */
 function belongsToGroup(prefix: string, pathname: string) {
   return pathname.startsWith(prefix)
-    || (prefix === "/products" && pathname.startsWith("/asin-list"));
+    || (prefix === "/products" && pathname.startsWith("/asin-list"))
+    || (prefix === "/products" && pathname.startsWith("/semantic-classifications"));
 }
 
 const navStructure: NavEntry[] = [
@@ -27,6 +28,7 @@ const navStructure: NavEntry[] = [
       { href: "/operators", label: "运营人员", icon: "👥" },
       { href: "/lifecycle", label: "生命周期", icon: "🔄" },
       { href: "/category-leadtimes", label: "分类工期", icon: "⏱️" },
+      { href: "/semantic-classifications", label: "缓存天数语义分类", icon: "🏷️" },
     ],
   },
   {

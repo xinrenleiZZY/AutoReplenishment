@@ -28,6 +28,14 @@ async def lifespan(app: FastAPI):
         logger.info(f"启动时运营人员同步完成: {stats}")
     except Exception as e:
         logger.error(f"启动时运营人员同步失败: {e}")
+    try:
+        from app.services.festival_year_roll import ensure_festival_year_current
+
+        async with async_session_factory() as session:
+            stats = await ensure_festival_year_current(session)
+        logger.info(f"启动时节日日历年校验完成: {stats}")
+    except Exception as e:
+        logger.error(f"启动时节日日历年校验失败: {e}")
     scheduler = setup_scheduler()
     scheduler.start()
     yield
@@ -112,6 +120,7 @@ from app.api.v1 import (  # noqa: E402
     product_costs,
     data_source,
     app_info,
+    semantic_classifications,
 )
 
 app.include_router(products.router, prefix="/api/v1/products", tags=["产品管理"])
@@ -128,3 +137,4 @@ app.include_router(ai.router, prefix="/api/v1/ai", tags=["AI评估"])
 app.include_router(product_costs.router, prefix="/api/v1/products", tags=["产品成本表"])
 app.include_router(data_source.router, prefix="/api/v1/data-source", tags=["数据来源核验"])
 app.include_router(app_info.router, prefix="/api/v1/app-info", tags=["应用信息"])
+app.include_router(semantic_classifications.router, prefix="/api/v1/semantic-classifications", tags=["缓存天数语义分类"])

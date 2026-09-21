@@ -49,8 +49,14 @@ def evaluate_special_orders(
     history: dict,
     lead_time: int | None,
     current_date: date = None,
+    festival_end: date = None,
+    buffer_days: int = 0,
 ) -> dict:
     """评估特例加订/不加订规则，返回命中情况与标签
+
+    Args:
+        festival_end: 节日结束时间（festival_calendar.festival_end），用于计算产品剩余可售卖时间
+        buffer_days: 缓存天数（装饰品14/非装饰品3，由语义分类判定）
 
     返回:
       {
@@ -75,10 +81,24 @@ def evaluate_special_orders(
 
     monthly_avg = history.get("monthly_avg") or 0
     last_year_same_month = history.get("last_year_same_month") or 0
-    yoy = (monthly_avg / last_year_same_month) if last_year_same_month > 0 else None
+    # 增长倍数口径（情况4）：节日老品用「节日窗口趋势系数」（今年近30天÷去年同30天，Step 4 新口径）；
+    # 无节日老品（长期产品/未匹配 festival_calendar）沿用旧口径（今年均量÷去年同月）
+    # 注：长期产品的 Step 4/5 已改窗口口径（lt_trend_coeff），此处情况4 本轮不改，仍走旧口径
+    trend_coeff = history.get("trend_coeff")
+    if trend_coeff is not None:
+        yoy = float(trend_coeff)
+        yoy_desc = f"节日窗口趋势系数{yoy:.2f}（今年近30天÷去年同30天）"
+    else:
+        yoy = (monthly_avg / last_year_same_month) if last_year_same_month > 0 else None
+        yoy_desc = f"今年均量{monthly_avg}为去年同月{last_year_same_month}的{yoy:.0%}" if yoy is not None else ""
 
     inventory_days = inventory.get("inventory_days")
     replenishment_cycle = inventory.get("replenishment_cycle")
+
+    # 产品剩余可售卖时间 = 节日结束时间 − 当前时间 − 缓存天数（缓冲天数）
+    remaining_sellable_days = None
+    if festival_end is not None:
+        remaining_sellable_days = (festival_end - current_date).days - (buffer_days or 0)
 
     # 成本表盈利性：全渠道亏损时老品/连续出单加订一律不命中（本质要赚钱）
     cost_table = None
@@ -111,12 +131,12 @@ def evaluate_special_orders(
         })
 
     # 情况3：成本表利润1-2美金 + 对手高峰溢价≥5美金 —— 对手价格数据缺失，不自动判定
-    # 情况4：老品，今年均量同比≥10% + 自然排位P1-P2 + 近30天ACOS≤35%
+    # 情况4：老品，同比增长≥10%（节日老品按节日窗口趋势系数，Q9 新口径） + 近30天ACOS≤35%
     if not is_new and not all_loss and yoy is not None and yoy >= 1.10 \
             and acos is not None and acos <= 0.35:
         result["add_cases"].append({
             "id": 4, "name": "老品同比增长加订",
-            "detail": f"今年均量{monthly_avg}为去年同月{last_year_same_month}的{yoy:.0%}（≥10%），ACOS={acos:.1%}≤35%；自然排位P1-P2未校验（系统暂无排名数据）",
+            "detail": f"{yoy_desc}（≥10%），ACOS={acos:.1%}≤35%；自然排位P1-P2未校验（系统暂无排名数据）",
         })
 
     # 情况5：仅新品，连续7天每天出单 + 一周出单≥10 + ACOS≤30%（加分：ACOS≤20%）
@@ -146,12 +166,12 @@ def evaluate_special_orders(
 
     if profit_rate is not None and profit_rate >= 0.15 \
             and acos is not None and acos <= 0.30 and _rating_ok(stars):
-        # 情况1：体积大只有海运赚钱，剩余可售时间 < 补货周期 → 放弃
-        if inventory_days is not None and replenishment_cycle is not None \
-                and inventory_days < replenishment_cycle:
+        # 情况1：产品剩余可售卖时间 < 补货周期 → 放弃
+        if remaining_sellable_days is not None and replenishment_cycle is not None \
+                and remaining_sellable_days < replenishment_cycle:
             result["block_cases"].append({
                 "id": 1, "name": "剩余时间不足不加订",
-                "detail": f"利润率{profit_rate:.0%}≥15%、ACOS={acos:.1%}≤30%、评分达标，但剩余可售{inventory_days}天 < 补货周期{replenishment_cycle}天（体积大仅海运可盈利），放弃加订",
+                "detail": f"利润率{profit_rate:.0%}≥15%、ACOS={acos:.1%}≤30%、评分达标，但产品剩余可售卖时间{remaining_sellable_days}天 < 补货周期{replenishment_cycle}天（体积大仅海运可盈利），放弃加订",
             })
         # 情况2：大货工期 > 剩余可售时间 → 放弃
         if inventory_days is not None and lead_time is not None and lead_time > inventory_days:

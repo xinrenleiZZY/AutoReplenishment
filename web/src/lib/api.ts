@@ -382,6 +382,18 @@ export interface CategoryLeadtime {
   notes: string | null;
 }
 
+export interface SemanticClassification {
+  asin: string;
+  listing_title: string | null;
+  semantic_classification: string | null;
+  updated_at: string | null;
+}
+
+export interface SemanticClassificationPage {
+  total: number;
+  items: SemanticClassification[];
+}
+
 export interface DataSourceDict {
   id: number;
   table_name: string;
@@ -940,6 +952,10 @@ export const api = {
     update: (id: number, data: Partial<Pick<CategoryLeadtime, "level1_category" | "level2_category" | "lead_time_min" | "lead_time_max" | "notes">>) =>
       fetchJSON<CategoryLeadtime>(`/api/v1/category-leadtimes/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     remove: (id: number) => fetchJSON<{ message: string }>(`/api/v1/category-leadtimes/${id}`, { method: "DELETE" }),
+  },
+  semanticClassifications: {
+    list: (params?: { skip?: number; limit?: number }) =>
+      fetchJSON<SemanticClassificationPage>(`/api/v1/semantic-classifications${toQuery({ limit: 50, ...params })}`),
   },
   dataSource: {
     list: (params?: { category?: string; q?: string; skip?: number; limit?: number }) =>

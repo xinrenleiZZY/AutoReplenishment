@@ -35,6 +35,7 @@ TABLE_META = {
     "tag_festival_map":            ("基础数据(标签-节日映射)", "人工维护", "手动", "基础数据"),
     "festival_lifecycle_days":     ("基础数据(节日生命周期)", "人工维护", "手动", "基础数据"),
     "category_leadtimes":          ("基础数据(分类工期)", "人工维护", "手动", "基础数据"),
+    "semantic_classifications":    ("基础数据(AI语义分类)", "AI生成(DeepSeek)", "每日", "基础数据"),
     "operators":                   ("运营人员(从products同步+人工)", "自动同步/人工", "启动/手动", "基础数据"),
     "config_params":               ("系统配置参数", "人工维护(.env/页面)", "手动", "系统"),
     "sync_logs":                   ("系统同步任务日志", "系统记录", "每日", "系统"),

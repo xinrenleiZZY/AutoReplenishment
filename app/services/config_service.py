@@ -51,6 +51,7 @@ PARAM_DEFS: dict[str, tuple] = {
     "listing_exclude_asins": (settings.LISTING_EXCLUDE_ASINS, "ASIN排除列表（逗号/换行分隔；同步/清洗时强制停用并标记「已排除」，仍会落库）", "str"),
     "listing_keep_asins": (settings.LISTING_KEEP_ASINS, "ASIN保留列表（逗号/换行分隔；优先级高于排除，清洗时不被覆盖状态、且不会被自动标记已删除）", "str"),
     "asin_list_updated_at": ("", "ASIN列表最近一次手动操作时间（排除/保留/添加/删除）", "str"),
+    "festival_year_base": (0, "节日日历年份基准（内部标记：节日日期当前对齐的年份，每年12-31 23:59 自动+1）", "int"),
     "asin_list_refresh_pending": ("0", "ASIN列表存在待刷新操作（1=待刷新，由每10分钟任务重新清洗后清零）", "int"),
     "decoration_buffer_days": (settings.DECORATION_BUFFER_DAYS, "节日产品缓冲天数-装饰类", "int"),
     "non_decoration_buffer_days": (settings.NON_DECORATION_BUFFER_DAYS, "节日产品缓冲天数-非装饰/DIY", "int"),
