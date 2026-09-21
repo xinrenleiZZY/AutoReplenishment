@@ -823,20 +823,57 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
                 })
             inventory["long_term_window"] = lt_win
 
-        # 老品库存天数统一落值（无窗口时保持 _analyze_inventory 的领星/系统兜底，本轮不处理）
+        # ── 老品库存天数唯一入口（四套逻辑中的三套，按优先级落值） ──
+        #    ① 老品（唯一口径）窗口各月占比逐月扣减：有窗口各月占比（节日窗口优先 → 长期产品窗口）
+        #    ② 老品-数据过少兜底：lx_used → 沿用领星可售天数/预估日销（不参与窗口口径）
+        #    ③ 老品-无窗口：无节日且非长期 → 库存天数留空、不触发采购
         _old_cov = _old_product_inventory_days(inventory, festival_window)
         if _old_cov["source"] == "window":
+            # ① 唯一口径
             inventory["inventory_days"] = _old_cov["days"]
             inventory["inventory_days_source"] = "window"
             inventory["inventory_days_formula"] = _old_cov["formula"]
+        elif inventory.get("lx_used"):
+            # ② 领星兜底：沿用 _analyze_inventory 的领星可售天数/预估日销
+            inventory["inventory_days_source"] = "lx"
+        else:
+            # ③ 无窗口：留空。不采用 _analyze_inventory 的系统公式值，否则与 Step 7/结果表（留空）矛盾
+            inventory["inventory_days"] = None
+            inventory["inventory_days_source"] = "none"
+            inventory["inventory_days_formula"] = _old_cov["formula"]
 
-    # 口径可追溯：判断依据里写明本次实际使用的公式（窗口逐月扣减 / 领星兜底 / 系统公式）
-    _b6_days_formula = inventory.get("inventory_days_formula") or "系统公式"
-    _b6_kind = ("窗口各月占比逐月扣减" if inventory.get("inventory_days_source") == "window"
-                else ("领星(数据过少兜底)" if inventory.get("lx_used") else "系统公式"))
+    # ── 库存天数口径可溯源：分析过程溯源里写明本条用的是哪一套逻辑（四套互斥，全集随记录落库）──
+    if is_new_product:
+        _b6_kind = "新品：库存售卖天数 = 可用库存 ÷ 预测日销"
+        _b6_days_formula = ("新品口径：可用库存 ÷ 预测日销（预测日销 = 基准 × 生命周期日销系数 × 安全系数，"
+                            "在 Step N1+ 新品决策流程计算并回填）")
+        # 新品在 Step 6 尚未进入新品决策流程，库存天数此时未定（不展示 _analyze_inventory 的日均口径值）
+        _b6_days_value = None
+    elif inventory.get("inventory_days_source") == "window":
+        _b6_kind = "老品（唯一口径）：窗口各月占比逐月扣减"
+        _b6_days_formula = inventory.get("inventory_days_formula") or "窗口口径"
+        _b6_days_value = inventory.get("inventory_days")
+    elif inventory.get("lx_used"):
+        _b6_kind = "老品-数据过少兜底：领星可售天数 / 预估日销"
+        _b6_days_formula = inventory.get("inventory_days_formula") or "领星口径"
+        _b6_days_value = inventory.get("inventory_days")
+    else:
+        _b6_kind = "老品-无窗口：无节日且非长期 → 库存天数留空、不触发采购"
+        _b6_days_formula = inventory.get("inventory_days_formula") or "无窗口各月占比，库存天数不计算（留空）"
+        _b6_days_value = inventory.get("inventory_days")
+    # 四套全集（供溯源对照，标记本条适用哪套）
+    _b6_all_kinds = {
+        "老品（唯一口径）：窗口各月占比逐月扣减": "各月预估 = 去年该月逐日和 × 趋势系数 → 该月日均 = 该月预估 ÷ 该月天数 → 自窗口首日逐月扣可用库存",
+        "老品-数据过少兜底：领星可售天数 / 预估日销": "数据过少（近3天无销量或覆盖<20天）→ lx_used，直接沿用领星可售天数/预估日销",
+        "新品：库存售卖天数 = 可用库存 ÷ 预测日销": "新品决策流程内：库存售卖天数 = 可用库存 ÷ 预测日销",
+        "老品-无窗口：无节日且非长期 → 库存天数留空、不触发采购": "无任何窗口各月占比 → 库存天数不计算（留空）",
+    }
+    _b6_all_kinds_marked = {
+        k: (f"【本条适用】{v}" if k == _b6_kind else v) for k, v in _b6_all_kinds.items()
+    }
     _b6_arrival_formula = inventory.get("inbound_arrival_formula") or "无在途（FBA在途+采购待到货=0），不计算上架日"
     _b6_reason = "\n".join([
-        f"可用库存={inventory.get('available_stock')}, 覆盖天数={inventory.get('inventory_days')}, "
+        f"可用库存={inventory.get('available_stock')}, 覆盖天数={_b6_days_value}, "
         f"口径={_b6_kind}",
         f"可用库存公式：{inventory.get('available_stock_formula') or '—'}",
         f"覆盖天数公式：{_b6_days_formula}",
@@ -845,10 +882,11 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     recorder.record(6, "库存健康分析", {
         "available_stock": inventory.get("available_stock"),
         "fba_available": inventory.get("fba_available"),
-        "inventory_days": inventory.get("inventory_days"),
+        "inventory_days": _b6_days_value,
         "replenishment_cycle": inventory.get("replenishment_cycle"),
         "口径": _b6_kind,
         "覆盖天数口径": _b6_days_formula,
+        "库存天数四套逻辑（互斥，标记本条适用）": _b6_all_kinds_marked,
         "可用库存口径": inventory.get("available_stock_formula"),
         "销量数据天数": inventory.get("data_days"),
         "领星可售天数": inventory.get("fba_available_days"),
@@ -912,6 +950,7 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         recorder.record(7, "采购触发判断", {
             "purchase_trigger": trigger.get("purchase_trigger"),
             "inventory_days": trigger.get("inventory_days"),
+            "库存天数口径": _b6_kind,
             "replenishment_cycle": trigger.get("replenishment_cycle"),
             "transport_cycles": trigger.get("transport_cycles"),
             "recommended_transport": trigger.get("recommended_transport"),
@@ -4024,8 +4063,8 @@ def _old_product_inventory_days(inventory: dict, festival_window: dict | None = 
     数据源 = _window_coverage（节日窗口优先，其次长期产品窗口）：
       - 有各月占比 → days = 覆盖天数（上限365），formula 写明各月日均与覆盖截止日；
       - 去年同窗口无销量（无各月占比）→ days = None（库存天数留空）；
-      - 无任何窗口（老品无节日且非长期，本轮不处理）→ days = None 且 source = "none"
-        （调用方沿用领星/系统兜底，不改动这部分行为）。
+      - 无任何窗口（老品无节日且非长期）→ days = None 且 source = "none"
+        （库存天数留空、不触发采购；数据过少的产品走领星兜底，不在本函数内）。
 
     返回 {"days": int|None, "source": "window"|"none", "formula": str}
     """
@@ -4055,7 +4094,7 @@ def _old_product_inventory_days(inventory: dict, festival_window: dict | None = 
             window_label = f"{lt.get('window_start')}~{lt.get('window_end')}"
     if not src:
         return {"days": None, "source": "none",
-                "formula": "无窗口（老品库存天数仅按窗口各月占比逐月扣减口径，本轮不处理无节日且非长期产品）"}
+                "formula": "无窗口（无节日且非长期）→ 库存天数留空、不触发采购"}
     if cov_days is None:
         return {"days": None, "source": "window",
                 "formula": f"{src}[{window_label}]去年同窗口无销量（无各月占比）→ 库存天数不计算（留空）"}
@@ -4384,7 +4423,8 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
 
     # ── 库存天数唯一口径（与 Step 6 同源）：窗口「各月预估 ÷ 该月天数 → 逐月扣减」──
     #    有窗口（节日优先 / 长期产品）→ 覆盖天数；无各月占比 → 留空（None）；
-    #    无窗口（老品无节日且非长期，本轮不处理）→ 保持 None，不另立口径。
+    #    无窗口（老品无节日且非长期）→ 留空、不触发采购（保持 None，不另立口径）。
+    #    数据过少的产品走上方领星分支，不用窗口口径。
     _cov = _old_product_inventory_days(inventory, inventory.get("festival_window"))
     if _cov["source"] == "window":
         inventory_days = _cov["days"]
