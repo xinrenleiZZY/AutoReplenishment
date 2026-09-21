@@ -340,15 +340,17 @@ async def evaluate_purchase(asin: str, session: AsyncSession) -> dict:
             if _fw:
                 _ws = _fw.get("win_start")
                 _we = _fw.get("win_end")
-                # 与 _calc_festival_window 口径一致：窗口天数 = 窗口集合各月实际天数之和，
-                # 不用 win_start→win_end 跨度（跨年/跳跃窗口会覆盖全年 365 天，把日均"年化"）。
+                # 与 _calc_festival_window 口径一致：窗口天数 = 今年窗口（明天→节日结束）的日历天数
                 _wd = int(_fw.get("window_days") or 0)
                 if _wd <= 0:
                     _wd = ((_we - _ws).days + 1) if (_ws and _we) else None
                 _avail = int(_inv.get("available_stock") or 0)
                 _est = _fw.get("window_estimate") or 0
                 _daily = (_est / _wd) if (_wd and _est > 0) else 0
-                _cov = round(_avail / _daily) if _daily > 0 else None
+                # 库存覆盖天数：优先用「预估总量 × 各月占比 → 每月 ÷ 该月天数」逐月扣减结果
+                _cov = _fw.get("coverage_days")
+                if _cov is None:
+                    _cov = round(_avail / _daily) if _daily > 0 else None
                 festival_info = {
                     "节日": product.festival,
                     "窗口月份": _fw.get("window_months"),
@@ -361,6 +363,8 @@ async def evaluate_purchase(asin: str, session: AsyncSession) -> dict:
                     "窗口日均需求": round(_daily, 1) if _daily else None,
                     "当前可用库存": _avail,
                     "窗口口径库存覆盖天数": _cov,
+                    "库存覆盖截止日": _fw.get("coverage_until"),
+                    "库存覆盖逐月明细": _fw.get("coverage_months"),
                     "系统最新计算库存天数": latest.inventory_days if latest else None,
                 }
         except Exception as _e:
