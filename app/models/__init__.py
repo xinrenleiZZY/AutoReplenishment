@@ -23,6 +23,7 @@ from app.models.purchase_plan import PurchasePlan
 from app.models.purchase_plan_items import PurchasePlanItem
 from app.models.purchase_order_board import PurchaseOrderBoard
 from app.models.semantic_classification import SemanticClassification
+from app.models.product_lists_raw import ProductListsRaw
 
 __all__ = [
     "Product",
@@ -52,4 +53,5 @@ __all__ = [
     "PurchasePlanItem",
     "PurchaseOrderBoard",
     "SemanticClassification",
+    "ProductListsRaw",
 ]

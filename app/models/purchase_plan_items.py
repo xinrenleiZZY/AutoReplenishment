@@ -34,6 +34,7 @@ class PurchasePlanItem(Base):
     ppg_sn: Mapped[str | None] = mapped_column(String(50), index=True, comment="采购计划单号(外层分组 ppg_sn)")
     ppg_sn_id: Mapped[str | None] = mapped_column(String(50), comment="采购计划单业务ID")
     group_id: Mapped[int | None] = mapped_column(BigInteger, comment="外层分组元素id")
+    create_time: Mapped[str | None] = mapped_column(String(50), comment="采购计划单创建时间(外层分组 create_time)")
     # ── 商品 ──
     product_id: Mapped[int | None] = mapped_column(BigInteger, index=True, comment="领星商品ID")
     product_name: Mapped[str | None] = mapped_column(Text, comment="品名(items.product_name)")

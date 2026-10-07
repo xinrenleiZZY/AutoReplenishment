@@ -4,6 +4,7 @@ import asyncio
 import calendar
 import json
 import logging
+import os
 from datetime import date, timedelta
 from math import ceil
 from typing import Optional
@@ -18,7 +19,6 @@ from app.models.sales import SalesData
 from app.models.daily_sales_stat import DailySalesStat
 from app.models.inventory import InventorySnapshot
 from app.models.daily_snapshot import DailySalesSnapshot
-from app.models.category_leadtime import CategoryLeadtime
 from app.models.calculation import (
     CalculationResult,
     CalculationStepResult,
@@ -27,7 +27,7 @@ from app.models.calculation import (
 )
 from app.models.ai_evaluation import AiEvaluation
 from app.models.operator import Operator
-from app.services.time_axis import get_sales_phase, check_purchase_window, get_recommended_transport, get_festival_info
+from app.services.time_axis import get_sales_phase, check_purchase_window, get_recommended_transport, get_festival_info, resolve_lead_time
 from app.services.semantic_classify import buffer_days, get_semantic_classification
 from app.services.forecast import (
     forecast_all_months,
@@ -813,8 +813,15 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
                 "monthly_forecast": forecast.get("forecast_months"),
             }
             # 库存天数与节日老品同口径：各月预估 ÷ 该月天数 → 按库存坐落月逐月扣减
-            if lt_win["window_start"] and lt_win["window_end"]:
-                _lt_cov = _window_coverage(inventory, lt_win, lt_win["window_start"], lt_win["window_end"])
+            #    history 里的 lt_window_start/lt_window_end 为 isoformat 字符串，
+            #    _window_coverage 内部需 date 参与比较/相减，这里先归一化
+            _lt_ws, _lt_we = lt_win["window_start"], lt_win["window_end"]
+            if _lt_ws and _lt_we:
+                _lt_cov = _window_coverage(
+                    inventory, lt_win,
+                    date.fromisoformat(str(_lt_ws)[:10]),
+                    date.fromisoformat(str(_lt_we)[:10]),
+                )
                 lt_win.update({
                     "coverage_days": _lt_cov["days"],
                     "coverage_until": _lt_cov["until"],
@@ -900,7 +907,7 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     }, input_data={"asin": asin}, reason=_b6_reason)
 
     # 解析大货工期：优先产品实际填写，否则按分类工期表(category_leadtimes)匹配
-    lead_time = await _resolve_lead_time(product, session)
+    lead_time = await resolve_lead_time(product, session)
 
     # ── 新品分支：只使用新品补货策略（需求文档第六章；第七-十四点新品不参与） ──
     _computed_stage = "新品" if is_new_product else "老品"
@@ -979,11 +986,8 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
             "suggested_qty": suggested_qty,
             "forecast_total": forecast.get("forecast_total"),
             "available_stock": inventory.get("available_stock"),
-            "monthly_forecast": inventory.get("monthly_forecast"),
-            "direct_sellable": inventory.get("direct_sellable"),
-            "direct_sellable_days": inventory.get("direct_sellable_days"),
+            "first_month_forecast_qty": inventory.get("first_month_forecast_qty"),
             "arrival_days": inventory.get("arrival_days"),
-            "sellable_gap_days": inventory.get("sellable_gap_days"),
             "sellable_gap_qty": inventory.get("sellable_gap_qty"),
             "在途预计上架日": inventory.get("inbound_arrival_date"),
             "在途预计上架日口径": inventory.get("inbound_arrival_formula"),
@@ -995,13 +999,10 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
             "inventory_days": inventory.get("inventory_days"),
             "replenishment_cycle": inventory.get("replenishment_cycle"),
             "festival": product.festival,
-            "monthly_forecast": inventory.get("monthly_forecast"),
-            "direct_sellable": inventory.get("direct_sellable"),
-            "direct_sellable_days": inventory.get("direct_sellable_days"),
+            "first_month_forecast_qty": inventory.get("first_month_forecast_qty"),
             "arrival_days": inventory.get("arrival_days"),
-            "sellable_gap_days": inventory.get("sellable_gap_days"),
             "sellable_gap_qty": inventory.get("sellable_gap_qty"),
-        }, reason=suggest_note or f"建议数量={suggested_qty}（生命周期预测未来销量−可使用库存−可售库存缺口数量，向上取整至箱规倍数）")
+        }, reason=suggest_note or f"建议数量={suggested_qty}（预测未来销量−可使用库存，向上取整至箱规倍数）")
 
         # ── Step 9: 规划批次 ──
         # 长期老品：规则版沿用默认分批，各月占比与当月预测供 Step 15 AI 分割批次（Q8）
@@ -1365,12 +1366,34 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         }, input_data={"asin": asin, "inventory_days": inventory.get("inventory_days")},
            reason=_hard_rule_hit["detail"], status="failed")
 
+    # ── 长期产品库存充足拦截（新老品统一；级别高于评分>80/特例加订/三裁判/AI） ──
+    #    长期产品「预测未来销量 ≤ 可用库存」→ 强制不采购
+    _long_term_block = (
+        None if _hard_rule_hit else _check_long_term_stock_cover(forecast, inventory, product)
+    )
+    if _long_term_block:
+        trigger["purchase_trigger"] = "无需采购"
+        trigger["reason"] = f"{_long_term_block['detail']} | {trigger.get('reason', '')}"
+        suggested_qty = 0
+        batch_plan = {"batches": [], "total_qty": 0}
+        # 仅在当前等级并非更强的拦截等级（终止/暂停）时降为观察
+        if scoring.get("purchase_level") not in ("终止", "暂停"):
+            scoring["purchase_level"] = "观察"
+        scoring.setdefault("score_detail", {})["长期产品库存充足拦截"] = _long_term_block
+        recorder.record(13, "长期产品库存充足拦截（高于三裁判）", {
+            "rule": _long_term_block["rule"],
+            "forecast_total": _long_term_block["forecast_total"],
+            "available_stock": _long_term_block["available_stock"],
+        }, input_data={"asin": asin, "product_type": getattr(product, "product_type", None)},
+           reason=_long_term_block["detail"], status="failed")
+
     # ── 三裁判仲裁：规则/特例/AI 两票一致即定，三方都不同规则裁判为准 ──
-    #    硬拦截（过季/新品门禁/库存上限/下降期/特例拦截/第二高峰/硬规则）在仲裁之上，命中则跳过仲裁。
+    #    硬拦截（过季/新品门禁/库存上限/下降期/特例拦截/第二高峰/硬规则/长期产品库存充足）在仲裁之上，命中则跳过仲裁。
     hard_blocked = (
         not purchase_window.get("can_purchase", True)
         or trigger.get("purchase_trigger") in ("禁止采购", "终止加订")
         or _cap_hit or _special_intercepted or _second_peak_blocked or _hard_rule_hit
+        or _long_term_block
         or scoring.get("purchase_level") == "终止"
     )
     if ai_verdict and not hard_blocked:
@@ -2783,7 +2806,7 @@ async def _forecast_sales_new_product(product: Product, session: AsyncSession) -
     today = date.today()
     life_cycle = product.life_cycle or ""
     is_long_term = (getattr(product, "product_type", "") or "").strip() == "长期产品"
-    lead_time = await _resolve_lead_time(product, session)
+    lead_time = await resolve_lead_time(product, session)
 
     festival_date = None
     if product.festival:
@@ -3169,6 +3192,9 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
         snap.fba_reserved if snap else None,
     )
     fba_inbound = _pick(prod_inbound, snap_inbound)
+    # 待调仓 / 调仓中：仅 products 表提供（库存快照无对应字段），缺失按 0
+    fba_fc_transfers = _safe_int(prod.reserved_fc_transfers) if prod else 0
+    fba_fc_processing = _safe_int(prod.reserved_fc_processing) if prod else 0
 
     if prod is None and snap is None:
         return {
@@ -3192,9 +3218,11 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
         prod.purchase_on_order if prod else None,
         snap.purchase_on_order if snap else None,
     )
-    # 可用库存 = FBA可售 + FBA预留 + FBA在途 + 本地库存 + 采购待到货
-    # 本地库存与采购待到货同样计入可用库存，确保节日窗口缺口、在途上架时间等处正常继续使用。
-    available = fba_available + fba_reserved + fba_inbound + local_stock + purchase_on_order
+    # 可用库存 = FBA可售 + FBA预留 + FBA在途 + 待调仓 + 本地库存 + 采购待到货
+    # 「调仓中」不再单列：FBA预留(afn_reserved_quantity)已包含调仓中，另加会重复计算；
+    # 「待调仓」不在预留内，需补入。本地库存与采购待到货同样计入可用库存。
+    available = (fba_available + fba_reserved + fba_inbound
+                 + fba_fc_transfers + local_stock + purchase_on_order)
 
     # 最近一次日销量快照（30天销量/日均，供触发与建议数量使用）
     snap2 = (await session.execute(
@@ -3302,12 +3330,15 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
         else:
             days_formula = f"系统公式：可用库存{available}÷{daily_formula}≈{inventory_days}天"
         stock_formula = (f"FBA可售{fba_only}+FBA预留{fba_reserved}+FBA在途{fba_inbound}"
+                         f"+待调仓{fba_fc_transfers}"
                          f"+本地库存{local_stock}+采购待到货{purchase_on_order}={available}")
         stockout_date = None  # 公式模式不推算售罄日，售罄日以领星字段为准（交叉验证展示）
         lx_used = False
     else:
-        # 领星口径：可用库存 = FBA可售 + 在途 + 本地库存 + 采购待到货（避免在途300被误判为0库存断货触发采购）
-        available = fba_only + fba_inbound + local_stock + purchase_on_order
+        # 领星口径：可用库存 = FBA可售 + 在途 + 待调仓 + 调仓中 + 本地库存 + 采购待到货
+        # （避免在途300被误判为0库存断货触发采购）
+        available = (fba_only + fba_inbound + fba_fc_transfers + fba_fc_processing
+                     + local_stock + purchase_on_order)
         daily_sales = lx_daily
         # 护栏：领星预估日销<=0（无销量）时，领星可售天数可能是"库存/0"的失真值
         # （如 21111/16711/13530 天），不能直接采信；改用实际销量兜底，仍无销量则不判积压
@@ -3339,6 +3370,7 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
             if _raw_days > inventory_days:
                 days_formula += f"；超365天上限截断为{inventory_days}天"
         stock_formula = (f"FBA可售{fba_only}+FBA在途{fba_inbound}"
+                         f"+待调仓{fba_fc_transfers}+调仓中{fba_fc_processing}"
                          f"+本地库存{local_stock}+采购待到货{purchase_on_order}={available}（领星口径不含FBA预留）")
         stockout_date = _pick(
             prod.stockout_date if prod else None,
@@ -3351,11 +3383,14 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
     # 修复2：在途库存预计上架时间点（FBA在途 + 采购待到货 何时能上架售卖）
     # 优先使用物流追踪实时库的真实到货时间（arrival_date = 预计到港 + 14天）；
     # 接口无数据/失败时回退估算：今天 + 到货天数（海运 淡季30/旺季45，当前8月起为旺季45） + FBA入仓上架缓冲3天。
-    inbound_total = fba_inbound + purchase_on_order
+    # 口径说明：在途合计 = 仅 FBA 在途（不含"采购待到货"；采购待到货已在可用库存中单列）。
+    inbound_total = fba_inbound
+    # 上架日判定口径：FBA在途 + 采购待到货（两者任一 >0 均需估算到货/上架时间）
+    _inbound_for_arrival = fba_inbound + purchase_on_order
     inbound_arrival_date = None
     inbound_arrival_source = None            # 物流实时库 / 估算公式
     inbound_arrival_formula = "无在途（FBA在途+采购待到货=0），不计算上架日"
-    if inbound_total > 0:
+    if _inbound_for_arrival > 0:
         _lx_err = ""
         try:
             from app.services.logistics_arrival import get_inbound_arrival_date, get_last_error
@@ -3411,77 +3446,6 @@ async def _analyze_inventory(asin: str, session: AsyncSession) -> dict:
         "lx_used": lx_used,
         "data_days": data_days,
     }
-
-
-def _row_mid(row) -> int:
-    """分类工期记录 → 中间值（天）；无效记录返回 None"""
-    lo, hi = row.lead_time_min, row.lead_time_max
-    if lo and hi:
-        return (lo + hi) // 2
-    if lo:
-        return lo
-    if hi:
-        return hi
-    return None
-
-
-async def _resolve_lead_time(product: Product, session: AsyncSession) -> int:
-    """解析大货工期：优先产品实际填写，否则按分类工期表(category_leadtimes)匹配，兜底30天
-
-    匹配规则：
-      1. products.category 精确匹配二级分类(level2_category) → 取该行工期中间值；
-      2. 精确匹配一级分类(level1_category)：
-         - 一级分类下有二级明细（分类挂在大类上）→ 按各二级最长工期（max 天数最大）取；
-         - 一级分类为独立行（level2 为空）→ 用该行工期；
-      3. 兜底 30 天。
-    """
-    if product.lead_time:
-        return int(product.lead_time)
-
-    # ── 0) 优先用二级分类(sub_category)精确匹配工期 ──
-    #    修复：原逻辑只用 product.category(一级，如"纸质印刷类")匹配，命中其下全部二级行后
-    #    按"最长工期"取 25 天，而"贴画类"工期实为 7-10 天(中间值8)。故先按 sub_category 精确匹配：
-    #       - 优先"一级+二级"联合匹配，避免同名二级跨大类误配；
-    #       - 匹配不到时再仅按二级分类匹配。
-    sub_category = (product.sub_category or "").strip()
-    if sub_category:
-        _base = select(CategoryLeadtime).where(CategoryLeadtime.level2_category == sub_category)
-        _cat = (product.category or "").strip()
-        _row = None
-        if _cat:
-            _row = (await session.execute(_base.where(CategoryLeadtime.level1_category == _cat))).scalar_one_or_none()
-        if _row is None:
-            _row = (await session.execute(_base)).scalar_one_or_none()
-        if _row is not None:
-            _mid = _row_mid(_row)
-            return _mid if _mid is not None else 30
-
-    category = (product.category or "").strip()
-    if not category:
-        return 30
-
-    # 1) 二级分类精确匹配（如 磁贴/硅胶类/纸质挂饰类）
-    row = (await session.execute(
-        select(CategoryLeadtime).where(CategoryLeadtime.level2_category == category)
-    )).scalar_one_or_none()
-    if row is not None:
-        mid = _row_mid(row)
-        return mid if mid is not None else 30
-
-    # 2) 一级分类匹配
-    rows = (await session.execute(
-        select(CategoryLeadtime).where(CategoryLeadtime.level1_category == category)
-    )).scalars().all()
-    if not rows:
-        return 30
-    if any(r.level2_category for r in rows):
-        # 分类挂在一级大类上 → 按最长工期（各二级 max 天数的最大值）
-        ends = [r.lead_time_max or r.lead_time_min for r in rows
-                if (r.lead_time_max or r.lead_time_min) is not None]
-        return max(ends) if ends else 30
-    # 一级独立行
-    mid = _row_mid(rows[0])
-    return mid if mid is not None else 30
 
 
 SECOND_PEAK_APPROACH_DAYS = 30  # 补货后库存覆盖到第二个高峰期开始前 N 天，视为“临近”
@@ -3805,6 +3769,35 @@ def _check_hard_rules(product: Product, inventory: dict, cfg: dict = None) -> Op
             "detail": f"剩余售卖天数（库存可售天数）={int(remain_days)}天 < 14天，直接终止加订",
         }
     return None
+
+
+def _check_long_term_stock_cover(forecast: dict, inventory: dict, product: Product) -> Optional[dict]:
+    """长期产品库存充足拦截（新老品统一口径，级别高于评分>80/特例加订/三裁判/AI）
+
+    长期产品若「预测未来销量 ≤ 可用库存」，说明当前可用库存已覆盖未来预测销量，
+    即使采购评分 > 80 也不采购。
+
+    命中返回 {"rule", "detail", ...}，未命中（非长期产品 / 预测未来销量>可用库存）返回 None。
+    """
+    if (getattr(product, "product_type", "") or "").strip() != "长期产品":
+        return None
+    forecast_total = forecast.get("forecast_total")
+    if forecast_total is None:
+        months = forecast.get("forecast_months") or []
+        forecast_total = sum(float(m.get("forecast_qty") or 0) for m in months)
+    forecast_total = float(forecast_total or 0)
+    available_stock = float(inventory.get("available_stock") or 0)
+    if forecast_total > available_stock:
+        return None
+    return {
+        "rule": "长期产品库存充足不采购",
+        "forecast_total": forecast_total,
+        "available_stock": available_stock,
+        "detail": (
+            f"长期产品预测未来销量{forecast_total} ≤ 可用库存{available_stock}，"
+            f"库存已覆盖未来需求，不采购（即使评分>80）"
+        ),
+    }
 
 
 async def _run_new_product_flow(
@@ -4138,13 +4131,8 @@ async def _calc_festival_window(product: Product, session: AsyncSession, invento
     # 窗口天数 = 今年连续日期区间（明天 → 节日结束）的实际天数
     window_days = max((win_end - win_start).days + 1, 1)
 
-    # 窗口内已售：周期自「明天」起，今天之前不产生窗口内销量
-    sold_in_window = 0
-
     available_stock = int(inventory.get("available_stock") or 0)
-    local_stock = int(inventory.get("local_stock") or 0)
-    purchase_on_order = int(inventory.get("purchase_on_order") or 0)
-    remaining = max(0, window_estimate - sold_in_window - available_stock - local_stock - purchase_on_order)
+    remaining = max(0, window_estimate - available_stock)
 
     # 未来窗口各月预估需求（用于分批次保护热卖月）：去年该月 × 趋势系数
     month_estimate = {}
@@ -4169,7 +4157,6 @@ async def _calc_festival_window(product: Product, session: AsyncSession, invento
         "g": round(trend - 1.0, 4),
         "window_estimate": window_estimate,
         "window_days": window_days,
-        "sold_in_window": sold_in_window,
         "remaining": remaining,
         "win_start": win_start,
         "win_end": win_end,
@@ -4306,23 +4293,10 @@ async def _calc_festival_window_legacy(product: Product, session: AsyncSession, 
         _me = date(festival_year + 1, 1, 1) if _m == 12 else date(festival_year, _m + 1, 1)
         window_days += (_me - _ms).days
     window_days = max(window_days, 1)
-    sold_cut = win_end if win_end < today else today
-    sold_in_window = int((await session.execute(
-        select(func.coalesce(func.sum(SalesData.sales_qty), 0))
-        .where(SalesData.asin == product.asin,
-               SalesData.date >= win_start, SalesData.date <= sold_cut)
-    )).scalar_one() or 0)
-    # 双源优先：SalesData 读不到窗口内已售时，回退 daily_sales_stats
-    if sold_in_window == 0:
-        fb_sold = await sum_daily_sales_dual(product.asin, win_start, sold_cut, session)
-        if fb_sold:
-            sold_in_window = fb_sold
 
-    # ── 剩余需求 = 窗口预估值 − 已售 − 可用库存 − 本地仓 − 采购在途 ──
+    # ── 剩余需求 = 窗口预估值 − 可用库存 ──
     available_stock = int(inventory.get("available_stock") or 0)
-    local_stock = int(inventory.get("local_stock") or 0)
-    purchase_on_order = int(inventory.get("purchase_on_order") or 0)
-    remaining = max(0, window_estimate - sold_in_window - available_stock - local_stock - purchase_on_order)
+    remaining = max(0, window_estimate - available_stock)
 
     # ── 未来窗口各月预估需求（用于分批次保护热卖月） ──
     month_estimate = {}
@@ -4350,7 +4324,6 @@ async def _calc_festival_window_legacy(product: Product, session: AsyncSession, 
         "g": g,
         "window_estimate": window_estimate,
         "window_days": window_days,
-        "sold_in_window": sold_in_window,
         "remaining": remaining,
         "win_start": win_start,
         "win_end": win_end,
@@ -4477,12 +4450,11 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
             # 「窗口各月预估 ÷ 该月天数 → 逐月扣减可用库存」，反映库存坐落在哪个月、能卖到哪天；
             # 无各月占比 → 留空（None）。
             est = festival_window.get("window_estimate") or 0
-            sold = festival_window.get("sold_in_window") or 0
             stock = int(inventory.get("available_stock") or 0)
             inventory_days = _cov["days"]
             inventory["inventory_days"] = inventory_days
             reason = (f"节日窗口[{window_label}]预估总需求{est}（{int((festival_window.get('g') or 0)*100)}%同期增长），"
-                      f"已售{sold}＋库存{stock}＋在途缺口{remaining}；{_cov['formula']}，需提前补货")
+                      f"库存{stock}＋在途缺口{remaining}；{_cov['formula']}，需提前补货")
             recommended = "海运"
             if hot_end and hot_end > date.today().month and hot_end - date.today().month <= 2:
                 recommended = "空派"  # 热卖月临近，海运恐赶不上，需空派保热卖
@@ -4550,21 +4522,123 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
     }
 
 
-def _calc_suggested_qty(forecast: dict, inventory: dict, product: Product) -> int:
-    """计算建议采购数量（需补货数量）
+def _simulate_sellable_before_arrival(forecast: dict, inventory: dict) -> dict:
+    """模拟到货前可售数量（老品可售库存缺口数量专用，仅写本地 json 备查，不落库）
 
-    需补货数量 = 生命周期预测未来销量 - 可使用库存 - 可售库存缺口数量
-      - 生命周期预测未来销量 demand = max(未来3个月预测需求, 实际日均销量 × 补货周期)
-        —— 解决"触发需要采购（库存天数<周期）但建议量为0"的矛盾：
-        库存只够 N 天而补货周期更长时，必须按周期内需求补足缺口，而不能只看3个月预测。
-      - 可使用库存 = FBA可售 + FBA预留 + FBA在途 + 本地库存 + 采购待到货
-        （_analyze_inventory.available_stock，已含本地/待到货，无需重复扣减）
-      - 可售库存缺口数量（仅当可售库存缺口天数>0生效，否则=0）：
-          直接可售卖库存 = FBA可售 + FBA预留
-          直接可售卖库存天数 = (FBA可售 + FBA预留) ÷ (预测未来月销量 ÷ 30)
-          FBA在途到货时间天数 = 物流接口到货时间 - 当前时间
-          可售库存缺口天数 = FBA在途到货时间天数 - 直接可售卖库存天数
-          可售库存缺口数量 = (预测未来月销量 ÷ 30) × 可售库存缺口天数
+    取「窗口首日 → FBA在途到货日」区间内的预估销量之和：
+      各月日均 = 该月预估销量 ÷ 该月在窗口内的天数
+        （首月按窗口首日→月末的剩余天数，末月按窗口结束日截断）
+      到货前天数 = 该月内落在到货日之前的天数
+    到货缺失 / 到货不晚于窗口首日 / 无未来月度预测 / 无节日窗口 → 0（无缺口风险）。
+
+    返回 {"qty": float, "arrival_days": int | None, "rows": [各月明细]}
+    """
+    months = forecast.get("forecast_months") or []
+    fw = inventory.get("festival_window") or {}
+    win_start_s = fw.get("win_start")
+    win_end_s = fw.get("win_end")
+    arrival_s = inventory.get("inbound_arrival_date")
+    result = {"qty": 0.0, "arrival_days": None, "rows": []}
+    if not months or not win_start_s or not win_end_s or not arrival_s:
+        return result
+    try:
+        win_start = date.fromisoformat(str(win_start_s))
+        win_end = date.fromisoformat(str(win_end_s))
+        arrival = date.fromisoformat(str(arrival_s))
+    except (ValueError, TypeError):
+        return result
+    result["arrival_days"] = (arrival - date.today()).days    # FBA在途到货时间天数（从今天起算）
+    if arrival <= win_start:                                  # 到货早于窗口首日，到货前不产生需求
+        return result
+    total = 0.0
+    rows = []
+    for item in months:
+        try:
+            _y, _m = str(item.get("month", "")).split("-")
+            m_first = date(int(_y), int(_m), 1)
+        except (ValueError, AttributeError):
+            continue
+        m_start = max(m_first, win_start)
+        m_end = min(_month_end(m_first), win_end)
+        if m_start > m_end:
+            continue
+        span = (m_end - m_start).days + 1                      # 该月在窗口内的天数
+        qty = float(item.get("forecast_qty") or 0)
+        daily = qty / span if span > 0 else 0.0                # 该月日均
+        seg_end = min(m_end, arrival)
+        if seg_end < m_start:                                  # 整个月都排在到货日之后
+            continue
+        seg_days = (seg_end - m_start).days + 1                # 到货前落在该月的天数
+        part = daily * seg_days
+        total += part
+        rows.append({
+            "month": item.get("month"),
+            "该月预估": qty,
+            "窗口内天数": span,
+            "日均": round(daily, 2),
+            "到货前天数": seg_days,
+            "到货前销量": round(part, 1),
+        })
+    result["qty"] = round(total, 1)
+    result["rows"] = rows
+    return result
+
+
+_PID_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "p_id"
+)
+
+
+def _dump_sellable_gap_sim(asin: str, inventory: dict, m: dict) -> None:
+    """把「模拟到货前可售数量／可售缺口数量」写入本地 json 备查（暂不落库）
+
+    路径与 p_id/sif_lifecycle 一致：p_id/sellable_gap/{asin}.json
+    （容器内 /app/p_id 已挂载到宿主机 ./p_id，写文件即可在宿主机直接查看）
+    """
+    if not asin:
+        return
+    try:
+        out_dir = os.path.join(_PID_DIR, "sellable_gap")
+        os.makedirs(out_dir, exist_ok=True)
+        record = {
+            "asin": asin,
+            "calc_date": date.today().isoformat(),
+            "可用库存": m.get("available_stock"),
+            "到货日": inventory.get("inbound_arrival_date"),
+            "到货天数": m.get("arrival_days"),
+            "模拟到货前可售数量": m.get("simulated_sellable_qty"),
+            "可售缺口数量": round(m.get("sellable_gap_qty") or 0, 1),
+            "基础建议(suggested_raw)": (
+                round(m["suggested_raw"], 1) if m.get("suggested_raw") is not None else None
+            ),
+            "预测未来销量(demand)": m.get("demand"),
+            "各月模拟明细": m.get("simulated_rows") or [],
+        }
+        with open(os.path.join(out_dir, f"{asin}.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+    except Exception as exc:  # 备查文件写入失败不影响主流程
+        logger.warning(f"写入可售缺口模拟文件失败 asin={asin}: {exc}")
+
+
+def _base_suggested_gap(forecast: dict, inventory: dict, product: Product) -> dict:
+    """基础建议量与可售库存缺口的公共计算
+
+    供 _calc_suggested_qty 与「长期产品库存充足拦截」共用，保证两处口径一致。
+
+    可售库存缺口数量（老品口径）：
+      模拟到货前可售数量 = 窗口首日 → FBA在途到货日 区间内各月预估销量之和
+        （各月预估 ÷ 该月天数 得日均，首月按窗口首日→月末的剩余天数）
+      可售库存缺口数量 = max(0, 模拟到货前可售数量 − 可用库存)
+
+    返回字段：
+      demand                生命周期预测未来销量
+      available_stock       可使用库存（已含 FBA可售/预留/在途/本地/采购待到货）
+      first_month_forecast_qty 首月（预测首月）预测销量
+      arrival_days          FBA在途到货时间天数（从今天起算）
+      simulated_sellable_qty 模拟到货前可售数量（仅本地 json 备查，不落库）
+      simulated_rows        模拟到货前各月明细
+      sellable_gap_qty      可售库存缺口数量
+      suggested_raw         基础建议 = demand - available_stock - sellable_gap_qty
     """
     months = forecast.get("forecast_months") or []
     three_month_demand = sum(m.get("forecast_qty", 0) for m in months[:3])
@@ -4582,46 +4656,56 @@ def _calc_suggested_qty(forecast: dict, inventory: dict, product: Product) -> in
         if thirty_volume and thirty_volume > 0:
             demand = int(thirty_volume) * 3
 
-    # 可使用库存（已含 FBA可售/预留/在途/本地/采购待到货）
     available_stock = inventory.get("available_stock", 0)
-    box_qty = _safe_int(product.box_quantity, 1)
-    min_order_qty = _safe_int(product.min_order_qty, 0)
+    first_month_forecast_qty = float((months[0].get("forecast_qty") if months else 0) or 0)  # 首月预测销量
 
-    # ── 可售库存缺口数量（FBA在途到货前，直接可售库存无法覆盖的缺口） ──
-    monthly_forecast = float((months[0].get("forecast_qty") if months else 0) or 0)  # 预测未来月销量
-    daily_forecast = monthly_forecast / 30 if monthly_forecast > 0 else 0
-    fba_available = float(inventory.get("fba_available") or 0)
-    fba_reserved = float(inventory.get("fba_reserved") or 0)
-    direct_sellable = fba_available + fba_reserved        # 直接可售卖库存
-    direct_sellable_days = round(direct_sellable / daily_forecast, 1) if daily_forecast > 0 else None
-    arrival_date = inventory.get("inbound_arrival_date")  # FBA在途库存到货时间
-    arrival_days = None
-    sellable_gap_days = None
-    sellable_gap_qty = 0.0
-    if daily_forecast > 0 and arrival_date:
-        try:
-            arrival = date.fromisoformat(str(arrival_date))
-        except (ValueError, TypeError):
-            arrival = None
-        if arrival is not None and direct_sellable_days is not None:
-            arrival_days = (arrival - date.today()).days      # FBA在途到货时间天数
-            sellable_gap_days = round(arrival_days - direct_sellable_days, 1)  # 可售库存缺口天数
-            if sellable_gap_days > 0:
-                sellable_gap_qty = daily_forecast * sellable_gap_days  # 可售库存缺口数量
+    # ── 可售库存缺口数量 = max(0, 模拟到货前可售数量 − 可用库存) ──
+    sim = _simulate_sellable_before_arrival(forecast, inventory)
+    simulated_sellable_qty = sim["qty"]
+    sellable_gap_qty = max(0.0, simulated_sellable_qty - float(available_stock or 0))
+
+    return {
+        "demand": demand,
+        "available_stock": available_stock,
+        "first_month_forecast_qty": first_month_forecast_qty,
+        "arrival_days": sim["arrival_days"],
+        "simulated_sellable_qty": simulated_sellable_qty,
+        "simulated_rows": sim["rows"],
+        "sellable_gap_qty": sellable_gap_qty,
+        "suggested_raw": demand - available_stock - sellable_gap_qty,
+    }
+
+
+def _calc_suggested_qty(forecast: dict, inventory: dict, product: Product) -> int:
+    """计算建议采购数量（需补货数量）
+
+    需补货数量 = 生命周期预测未来销量 - 可使用库存 - 可售库存缺口数量
+      - 生命周期预测未来销量 demand = max(未来3个月预测需求, 实际日均销量 × 补货周期)
+        —— 解决"触发需要采购（库存天数<周期）但建议量为0"的矛盾：
+        库存只够 N 天而补货周期更长时，必须按周期内需求补足缺口，而不能只看3个月预测。
+      - 可使用库存 = FBA可售 + FBA预留 + FBA在途 + 本地库存 + 采购待到货
+        （_analyze_inventory.available_stock，已含本地/待到货，无需重复扣减）
+      - 可售库存缺口数量 = max(0, 模拟到货前可售数量 − 可用库存)
+          模拟到货前可售数量 = 窗口首日 → FBA在途到货日 区间内各月预估销量之和
+          （各月预估 ÷ 该月天数 得日均，首月按窗口首日→月末的剩余天数）
+          该值仅写本地 json 备查（p_id/sellable_gap/{asin}.json），暂不落库
+    """
+    m = _base_suggested_gap(forecast, inventory, product)
     # 计算字段落回 inventory，供记录/展示
-    inventory["monthly_forecast"] = monthly_forecast
-    inventory["direct_sellable"] = direct_sellable
-    inventory["direct_sellable_days"] = direct_sellable_days
-    inventory["arrival_days"] = arrival_days
-    inventory["sellable_gap_days"] = sellable_gap_days
-    inventory["sellable_gap_qty"] = round(sellable_gap_qty, 1)
+    inventory["first_month_forecast_qty"] = m["first_month_forecast_qty"]
+    inventory["arrival_days"] = m["arrival_days"]
+    inventory["sellable_gap_qty"] = round(m["sellable_gap_qty"], 1)
+    # 模拟到货前可售数量：仅写本地 json 备查，暂不落库
+    _dump_sellable_gap_sim(getattr(product, "asin", ""), inventory, m)
 
     # 需补货数量 = 生命周期预测未来销量 - 可使用库存 - 可售库存缺口数量
-    suggested = demand - available_stock - sellable_gap_qty
+    suggested = m["suggested_raw"]
 
     if suggested <= 0:
         return 0
 
+    box_qty = _safe_int(product.box_quantity, 1)
+    min_order_qty = _safe_int(product.min_order_qty, 0)
     # 向上取整至装箱数量倍数（如 10000/300=33.33 → 34箱）
     suggested = ceil(suggested / box_qty) * box_qty
 
@@ -4765,7 +4849,7 @@ async def _build_batch_ai_context(asin: str, product: Product, suggested_qty: in
         "在途合计": inventory.get("inbound_total"),
         "预测总销量": forecast.get("forecast_total"),
         "未来月度预测": forecast.get("forecast_months"),
-        "月度需求(库存口径)": inventory.get("monthly_forecast"),
+        "首月预测销量(库存口径)": inventory.get("first_month_forecast_qty"),
         "节日窗口": inventory.get("festival_window"),
         # 老品-长期产品：去年各月销量占比 + 今年当月预测销量（Q8，供 AI 分割批次）
         "长期窗口": inventory.get("long_term_window"),
@@ -4985,7 +5069,16 @@ def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
         }
     life_score = life_cycle_scores.get(life_cycle, 50)
 
-    # 运输可达（10%）- 到货日期是否赶上销售窗口（生命周期阶段结束日期）
+    # 运输可达（10%）- 仅在有利润的渠道中判断能否赶上销售窗口
+    #   ① 先取成本表盈利渠道（sea/air/express 中 Profit>0 者）；三渠道全亏 → 无可选渠道 → 0 分；
+    #   ② 有利润渠道全部赶不上销售窗口 → 0 分；否则按能赶上的最优（最快）有利润渠道给分。
+    #   成本表异常时不阻塞评分，退化为不限制渠道。
+    try:
+        _ct = new_product_policy.calc_cost_table(product)
+        profitable_modes = set(_ct.get("profitable_modes") or [])
+    except Exception:  # noqa: BLE001
+        profitable_modes = {"sea", "air", "express"}
+
     if stage_end:
         tc = trigger.get("transport_cycles") or {}
         sea_days = int(tc.get("sea") or 0)
@@ -4998,29 +5091,23 @@ def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
             air_days = lt + (settings.AIR_PEAK_DAYS if is_peak else settings.AIR_SLOW_DAYS)
             express_days = lt + (settings.EXPRESS_PEAK_DAYS if is_peak else settings.EXPRESS_SLOW_DAYS)
         today = date.today()
-        if today + timedelta(days=sea_days) <= stage_end:
-            transport_score = 100  # 海运可按时到仓
-        elif today + timedelta(days=air_days) <= stage_end:
-            transport_score = 80   # 空派可按时到仓
-        elif today + timedelta(days=express_days) <= stage_end:
-            transport_score = 60   # 仅快递可赶上
+        if "sea" in profitable_modes and today + timedelta(days=sea_days) <= stage_end:
+            transport_score = 100  # 有利润的海运可按时到仓
+        elif "air" in profitable_modes and today + timedelta(days=air_days) <= stage_end:
+            transport_score = 80   # 有利润的空派可按时到仓
+        elif "express" in profitable_modes and today + timedelta(days=express_days) <= stage_end:
+            transport_score = 60   # 有利润的快递能赶上
         else:
-            transport_score = 0    # 无法赶上销售窗口
+            transport_score = 0    # 有利润渠道全部赶不上销售窗口（或三渠道全亏）
+    elif purchase_window and purchase_window.get("can_purchase", True):
+        # 有利润的推荐渠道才给分；推荐渠道亏损/三渠道全亏 → 0
+        _tmap = {"海运": ("sea", 100), "空派": ("air", 80), "快递": ("express", 60)}
+        _mode, _score = _tmap.get(purchase_window.get("recommended_transport", "海运"), (None, 0))
+        transport_score = _score if (_mode and _mode in profitable_modes) else 0
     elif purchase_window:
-        if purchase_window.get("can_purchase", True):
-            transport = purchase_window.get("recommended_transport", "海运")
-            if transport == "海运":
-                transport_score = 100
-            elif transport == "空派":
-                transport_score = 80
-            elif transport == "快递":
-                transport_score = 60
-            else:
-                transport_score = 0    # 其他运输方式：直接 0（不再给 50）
-        else:
-            transport_score = 0
+        transport_score = 0    # 无法赶上销售窗口（can_purchase=False）
     else:
-        transport_score = 70  # 默认
+        transport_score = 70 if profitable_modes else 0  # 默认：需有盈利渠道
 
     # 总分（评分平衡系数：各维度 × 系数后按系数总和归一化，保持 0-100）
     # 新品用 SCORE_BALANCE_*（.env，默认1.0均分）；老品用固定 ①20/②25/③25/④10/⑤10/⑥10

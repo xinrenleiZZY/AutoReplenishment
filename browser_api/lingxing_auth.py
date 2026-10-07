@@ -267,7 +267,10 @@ class LingxingAuth:
     # ────────────────────────────── 获取登录态（auth-token） ──────────────────────────────
 
     def fetch_auth_token(self, wait_seconds: int = 15) -> str | None:
-        """跳转 Listing 页面触发 showOnline 请求，捕获 auth-token，写回 .env。
+        """跳转 Listing 页面触发业务请求，捕获请求头中的 auth-token，写回 .env。
+
+        注：早期仅监听 showOnline 请求，但领星前端已改版不再发送该请求，
+        故改为「任意请求只要带 auth-token 头即捕获」，兼容旧版与新版的请求路径。
 
         Args:
             wait_seconds: 捕获等待时长（秒）
@@ -279,24 +282,19 @@ class LingxingAuth:
         captured = {"token": None}
 
         def _on_request(request):
+            token = ""
             try:
-                url = request.url or ""
+                token = request.headers.get("auth-token", "")
             except Exception:
-                return
-            if "showOnline" in url:
-                token = ""
+                pass
+            if not token:
                 try:
-                    token = request.headers.get("auth-token", "")
+                    hdr = request.all_headers()
+                    token = hdr.get("auth-token", "") or hdr.get("Auth-Token", "")
                 except Exception:
                     pass
-                if not token:
-                    try:
-                        token = (request.all_headers().get("auth-token", "") or
-                                 request.all_headers().get("Auth-Token", ""))
-                    except Exception:
-                        pass
-                if token:
-                    captured["token"] = token
+            if token:
+                captured["token"] = token
 
         try:
             page = self._get_erp_page(browser)

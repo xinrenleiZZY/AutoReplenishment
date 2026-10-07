@@ -32,10 +32,8 @@ from sqlalchemy import select, delete, update
 from app.database import async_session_factory
 from app.models.inventory import InventorySnapshot
 from app.models.product import Product
-from scripts.daily_sales_snapshot import fetch_page
+from scripts.daily_sales_snapshot import fetch_all
 from app.services.raw_store import flush_raw
-
-PER_PAGE = 200
 
 
 def _to_int(v):
@@ -46,20 +44,8 @@ def _to_int(v):
 
 
 def fetch_all_stock_web() -> list:
-    """showOnline 全量分页抓取（复用 daily_sales_snapshot 的鉴权/自动刷新 token 逻辑）"""
-    items = []
-    offset = 0
-    seq = 1
-    while True:
-        data = fetch_page(offset, seq)
-        lst = (data or {}).get("list") or []
-        items.extend(lst)
-        if len(lst) < PER_PAGE:
-            break
-        offset += PER_PAGE
-        seq += 1
-        if seq > 200:
-            break
+    """showOnline 全量抓取（经领星 API 服务站一次拉全量）"""
+    items, _total = fetch_all(1)
     return items
 
 

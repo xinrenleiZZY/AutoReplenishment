@@ -10,7 +10,7 @@
 
 用法:
     python scripts/sync_daily_sales.py --backfill                # 首次全量回填(去年1/1~今天)
-    python scripts/sync_daily_sales.py --daily                   # 每日增量(今天/昨天/前天)
+    python scripts/sync_daily_sales.py --daily                   # 每日增量(近7天)
     python scripts/sync_daily_sales.py --start 2025-01-01 --end 2026-09-01
 """
 
@@ -28,9 +28,7 @@ from sqlalchemy import delete, func, select
 from app.database import async_session_factory
 from app.models.daily_sales_stat import DailySalesStat
 from app.models.product import Product
-from scripts.sync_sales_statistics import (
-    PAGE_SIZE, REQUEST_INTERVAL, fetch_page,
-)
+from scripts.sync_sales_statistics import fetch_all
 
 SEQ_START = 100  # req_time_sequence 序号，避免与报表接口冲突
 
@@ -60,27 +58,17 @@ def extract_daily(item: dict) -> tuple[str | None, dict]:
 
 
 async def collect_daily(start: str, end: str, product_asins: set) -> dict:
-    """抓取区间内所有页面，返回 {asin: {日期: 单日销量}}，仅保留 product_asins 中的 ASIN"""
+    """抓取区间内所有 ASIN 单日销量（服务站一次拉全量），仅保留 product_asins 中的 ASIN"""
     seq = SEQ_START
-    page = 1
     result: dict = {}
-    while True:
-        data = await asyncio.to_thread(fetch_page, page, start, end, "volume", "asin", seq, "day")
-        lst = data.get("list") or []
-        for item in lst:
-            if not isinstance(item, dict):
-                continue
-            asin, daily = extract_daily(item)
-            if asin not in product_asins:
-                continue
-            result.setdefault(asin, {}).update(daily)
-        count = int(data.get("count") or 0)
-        offset = int(data.get("offset") or 0)
-        if len(lst) < PAGE_SIZE or (count and offset + len(lst) >= count):
-            break
-        page += 1
-        seq += 1
-        await asyncio.sleep(REQUEST_INTERVAL)
+    lst, _total = await asyncio.to_thread(fetch_all, start, end, "volume", "asin", "day", seq)
+    for item in lst:
+        if not isinstance(item, dict):
+            continue
+        asin, daily = extract_daily(item)
+        if asin not in product_asins:
+            continue
+        result.setdefault(asin, {}).update(daily)
     return result
 
 
@@ -170,9 +158,9 @@ async def backfill() -> dict:
 
 
 async def daily_update() -> dict:
-    """每日增量：今天/昨天/前天（近三天）"""
+    """每日增量：今天往前推 7 天（近7天），覆盖平台延迟结算/回溯改数"""
     today = date.today()
-    start = today - timedelta(days=2)
+    start = today - timedelta(days=6)
     end = today
     asins = await get_product_asins()
     print(f"[daily] {start} ~ {end}, 跟踪ASIN数: {len(asins)}")
@@ -198,7 +186,7 @@ async def manual_update(start: str, end: str, asins: set | None = None) -> dict:
 def main_cli():
     parser = argparse.ArgumentParser(description="领星逐日销量抓取")
     parser.add_argument("--backfill", action="store_true", help="首次全量回填(去年1/1~今天)")
-    parser.add_argument("--daily", action="store_true", help="每日增量(近三天)")
+    parser.add_argument("--daily", action="store_true", help="每日增量(近7天)")
     parser.add_argument("--start", type=str, default="", help="统计开始日期 YYYY-MM-DD")
     parser.add_argument("--end", type=str, default="", help="统计结束日期 YYYY-MM-DD")
     parser.add_argument("--asin", type=str, default="", help="只回填指定ASIN(可选，其余按跟踪产品全量)")
@@ -212,12 +200,12 @@ def main_cli():
         asins = {args.asin} if args.asin else None
         stats = asyncio.run(manual_update(args.start, args.end, asins))
     else:
-        # 默认：表空则回填，否则近三天增量
+        # 默认：表空则回填，否则近7天增量
         if asyncio.run(needs_backfill()):
             print("表未回填历史，执行首次全量回填")
             stats = asyncio.run(backfill())
         else:
-            print("已回填历史，执行近三天增量")
+            print("已回填历史，执行近7天增量")
             stats = asyncio.run(daily_update())
 
     print(f"\n结果: {stats}")

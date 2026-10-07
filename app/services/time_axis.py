@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.festival_calendar import FestivalCalendar
 from app.models.product import Product
+from app.models.category_leadtime import CategoryLeadtime
 from app.config import settings
 from app.services.semantic_classify import buffer_days, get_semantic_classification
 
@@ -250,6 +251,77 @@ async def get_sales_phase(product: Product, session: AsyncSession) -> dict:
     }
 
 
+def _row_mid(row) -> int:
+    """分类工期记录 → 中间值（天）；无效记录返回 None"""
+    lo, hi = row.lead_time_min, row.lead_time_max
+    if lo and hi:
+        return (lo + hi) // 2
+    if lo:
+        return lo
+    if hi:
+        return hi
+    return None
+
+
+async def resolve_lead_time(product: Product, session: AsyncSession) -> int:
+    """解析大货工期：优先产品实际填写，否则按分类工期表(category_leadtimes)匹配，兜底30天
+
+    匹配规则：
+      0. products.lead_time 优先；
+      1. products.sub_category 与分类工期表二级分类(level2_category)精确匹配（优先"一级+二级"联合）→ 取该行工期中间值；
+      2. products.category 精确匹配二级分类(level2_category) → 取该行工期中间值；
+      3. products.category 精确匹配一级分类(level1_category)：
+         - 一级分类下有二级明细（分类挂在大类上）→ 按各二级最长工期（max 天数最大）取；
+         - 一级分类为独立行（level2 为空）→ 用该行工期；
+      4. 兜底 30 天。
+    """
+    if product.lead_time:
+        return int(product.lead_time)
+
+    # ── 0) 优先用二级分类(sub_category)精确匹配工期 ──
+    #       - 优先"一级+二级"联合匹配，避免同名二级跨大类误配；
+    #       - 匹配不到时再仅按二级分类匹配。
+    sub_category = (product.sub_category or "").strip()
+    if sub_category:
+        _base = select(CategoryLeadtime).where(CategoryLeadtime.level2_category == sub_category)
+        _cat = (product.category or "").strip()
+        _row = None
+        if _cat:
+            _row = (await session.execute(_base.where(CategoryLeadtime.level1_category == _cat))).scalar_one_or_none()
+        if _row is None:
+            _row = (await session.execute(_base)).scalar_one_or_none()
+        if _row is not None:
+            _mid = _row_mid(_row)
+            return _mid if _mid is not None else 30
+
+    category = (product.category or "").strip()
+    if not category:
+        return 30
+
+    # 1) 二级分类精确匹配（如 磁贴/硅胶类/纸质挂饰类）
+    row = (await session.execute(
+        select(CategoryLeadtime).where(CategoryLeadtime.level2_category == category)
+    )).scalar_one_or_none()
+    if row is not None:
+        mid = _row_mid(row)
+        return mid if mid is not None else 30
+
+    # 2) 一级分类匹配
+    rows = (await session.execute(
+        select(CategoryLeadtime).where(CategoryLeadtime.level1_category == category)
+    )).scalars().all()
+    if not rows:
+        return 30
+    if any(r.level2_category for r in rows):
+        # 分类挂在一级大类上 → 按最长工期（各二级 max 天数的最大值）
+        ends = [r.lead_time_max or r.lead_time_min for r in rows
+                if (r.lead_time_max or r.lead_time_min) is not None]
+        return max(ends) if ends else 30
+    # 一级独立行
+    mid = _row_mid(rows[0])
+    return mid if mid is not None else 30
+
+
 async def check_purchase_window(product: Product, session: AsyncSession) -> dict:
     """判断当前是否还能赶上旺季采购
 
@@ -321,7 +393,7 @@ async def check_purchase_window(product: Product, session: AsyncSession) -> dict
             "days_remaining": 0,
             "reason": f"{product.festival} 销售时间段已开始或已结束，无法赶上采购窗口",
         }
-    lead_time = product.lead_time or 30
+    lead_time = await resolve_lead_time(product, session)
 
     # 判断产品类型以确定售卖截止日（语义分类：装饰品/非装饰品，取自 semantic_classifications 表）
     semantic = await get_semantic_classification(session, product.asin)

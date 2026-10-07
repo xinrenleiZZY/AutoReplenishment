@@ -23,8 +23,6 @@ import sys
 from collections import defaultdict
 from datetime import date
 
-import requests
-
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
@@ -37,6 +35,7 @@ from sqlalchemy import select, update
 from app.database import async_session_factory
 from app.models.inventory import InventorySnapshot
 from app.models.product import Product
+from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 API_URL = "https://huizhixin.lingxing.com/api/purchase/orderListsV2"
@@ -156,28 +155,6 @@ def _pick_best_name_match(cleaned: str, product_rows: list) -> str | None:
     return best_asin
 
 
-def _get_headers() -> dict:
-    token = os.getenv("LX_AUTH_TOKEN", "")
-    return {
-        "accept": "application/json, text/plain, */*",
-        "ak-client-type": "web",
-        "ak-origin": "https://huizhixin.lingxing.com",
-        "auth-token": token,
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://huizhixin.lingxing.com",
-        "referer": "https://huizhixin.lingxing.com/msupply/purchaseOrder",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
-        "x-ak-company-id": "90136117059997696",
-        "x-ak-env-key": "huizhixin",
-        "x-ak-language": "zh",
-        "x-ak-platform": "1",
-        "x-ak-request-source": "erp",
-        "x-ak-uid": "11054904",
-        "x-ak-version": "3.8.9.3.0.211",
-        "x-ak-zid": "1",
-    }
-
-
 def _payload(offset: int, seq: int) -> dict:
     return {
         "offset": offset,
@@ -215,40 +192,33 @@ def _payload(offset: int, seq: int) -> dict:
     }
 
 
-def fetch_all_orders(headers: dict) -> list:
-    """分页拉取待到货采购订单（接口 status=2 过滤；上限防死循环）"""
+def fetch_all_orders() -> list:
+    """拉取待到货采购订单（接口 status=2 过滤）
+
+    经领星 API 服务站转发（登录态由服务端注入），auto_pagination 一次拉全量；
+    服务端返回的 data 即订单扁平行列表（按 order_sn 去重）。
+    """
+    body = _payload(0, 1)
+    resp = station_proxy(url=API_URL, body=body, auto_pagination=True)
+    collect_raw("orderListsV2", resp, url=API_URL, method="POST", params=body)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[采购订单orderListsV2]调用失败: {resp.get('message')}")
     orders = []
-    offset = 0
-    seq = 1
     seen_sn = set()
-    while offset < 200 * PAGE_SIZE:
-        resp = requests.post(API_URL, headers=headers, json=_payload(offset, seq), timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        collect_raw("orderListsV2", data, url=API_URL, method="POST",
-                    params=_payload(offset, seq), status_code=resp.status_code)
-        if data.get("code") != 1:
-            raise RuntimeError(f"API error: code={data.get('code')} msg={data.get('msg')}")
-        lst = (data.get("data") or {}).get("list") or []
-        for o in lst:
-            sn = o.get("order_sn")
-            if sn and sn in seen_sn:
-                continue
-            if sn:
-                seen_sn.add(sn)
-            orders.append(o)
-        if len(lst) < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
-        seq += 1
-    else:
-        print("[WARN] 待到货订单超过分页上限，已截断")
+    for o in (resp.get("data") or []):
+        if not isinstance(o, dict):
+            continue
+        sn = o.get("order_sn")
+        if sn and sn in seen_sn:
+            continue
+        if sn:
+            seen_sn.add(sn)
+        orders.append(o)
     return orders
 
 
 async def main(dry_run: bool = False) -> dict:
-    headers = _get_headers()
-    orders = fetch_all_orders(headers)
+    orders = fetch_all_orders()
     pending = [o for o in orders if (o.get("status_text") or "") == PENDING_STATUS]
     print(f"采购订单: {len(orders)} 条，待到货: {len(pending)} 条")
 

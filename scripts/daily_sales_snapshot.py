@@ -20,7 +20,6 @@
 import os
 import sys
 import json
-import time
 import asyncio
 import argparse
 from datetime import date, datetime
@@ -28,19 +27,18 @@ from datetime import date, datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
-import requests
 from dotenv import load_dotenv
 load_dotenv()
 
 from app.database import async_session_factory
 from app.models.daily_snapshot import DailySalesSnapshot
+from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 # ============ 配置 ============
 SALES_HISTORY_DIR = os.path.join(BASE_DIR, "p_id", "sales_history")
 API_URL = "https://gw.lingxingerp.com/listing-api/api/product/showOnline"
 PER_PAGE = 200
-REQUEST_INTERVAL = 0.3  # 请求间隔（秒）
 
 # ============ 销量关键字段（从 showOnline 响应中提取） ============
 SALES_FIELDS = [
@@ -66,55 +64,10 @@ SALES_FIELDS = [
     "category_rank",         # 类目排名（取数字部分）
 ]
 
-# ============ 认证 ============
-def get_auth_token():
-    token = os.getenv("LX_AUTH_TOKEN", "")
-    if not token:
-        token = "9734U0+ydVSMrW06kQ/RdDXMCZ2gvyWT2bgoUTsSioC+2hzQmMQ0EBm54bF3TsG3A8BVXFU/sutsxCuzIFdlbKOV4Eyqm5qQC4medqn5aINFdaf+RSZgJzuy1WayIHU14lqlKGaDkY8NMghvUrptwcTyTeg"
-    return token
-
-AUTH_TOKEN = get_auth_token()
-HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "ak-client-type": "web",
-    "ak-origin": "https://huizhixin.lingxing.com",
-    "auth-token": AUTH_TOKEN,
-    "content-type": "application/json;charset=UTF-8",
-    "origin": "https://huizhixin.lingxing.com",
-    "referer": "https://huizhixin.lingxing.com/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
-    "x-ak-company-id": "90136117059997696",
-    "x-ak-env-key": "huizhixin",
-    "x-ak-language": "zh",
-    "x-ak-platform": "1",
-    "x-ak-request-source": "erp",
-    "x-ak-uid": "11054904",
-    "x-ak-version": "3.8.7.3.0.148",
-    "x-ak-zid": "1",
-}
-
-
-def _refresh_auth_token() -> bool:
-    """鉴权失败时调用独立模块刷新 token（CDP 自动登录+捕获），并重载 HEADERS"""
-    global AUTH_TOKEN
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from browser_api.lingxing_auth import LingxingAuth
-        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
-        token = LingxingAuth(cdp_port=cdp_port).ensure_token()
-        if token:
-            AUTH_TOKEN = token
-            HEADERS["auth-token"] = token
-            print(f"[INFO] auth-token 已自动刷新: {token[:15]}...")
-            return True
-    except Exception as e:
-        print(f"[WARN] 自动刷新 token 失败: {e}")
-    return False
-
-
-def fetch_page(offset: int, seq: int, allow_refresh: bool = True) -> dict:
-    """获取一页产品数据（鉴权失败时自动刷新 token 重试一次）"""
-    payload = {
+# ============ 数据抓取（经领星 API 服务站） ============
+def _build_payload(offset: int, seq: int) -> dict:
+    """构造 showOnline 请求体；offset/length 由服务站 auto_pagination 自动翻页"""
+    return {
         "offset": offset,
         "length": PER_PAGE,
         "search_field": "msku",
@@ -127,19 +80,21 @@ def fetch_page(offset: int, seq: int, allow_refresh: bool = True) -> dict:
         "global_tag_ids": "",
         "req_time_sequence": f"/listing-api/api/product/showOnline$daily${seq}",
     }
-    resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    collect_raw("showOnline", data, url=API_URL, method="POST",
-                params=payload, status_code=resp.status_code)
-    if data.get("code") != 1:
-        err = f"API error: code={data.get('code')}, msg={data.get('msg')}"
-        if allow_refresh and (str(data.get("code")) == "8003" or "鉴权" in str(data.get("msg"))):
-            print(f"[WARN] 鉴权失败({err})，尝试自动刷新 token...")
-            if _refresh_auth_token():
-                return fetch_page(offset, seq, allow_refresh=False)
-        raise Exception(err)
-    return data.get("data", {})
+
+
+def fetch_all(seq: int = 1) -> tuple[list[dict], int]:
+    """经服务站一次拉取全量在线产品（登录态由服务端注入，自动翻页）
+
+    服务端 auto_pagination 自动翻 offset/length；返回 data 即产品扁平行列表。
+    """
+    body = _build_payload(0, seq)
+    resp = station_proxy(url=API_URL, body=body, auto_pagination=True)
+    collect_raw("showOnline", resp, url=API_URL, method="POST", params=body)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[产品showOnline]调用失败: {resp.get('message')}")
+    lst = [it for it in (resp.get("data") or []) if isinstance(it, dict)]
+    total = int(resp.get("total") or len(lst))
+    return lst, total
 
 
 def extract_sales_data(item: dict) -> dict:
@@ -198,38 +153,15 @@ def take_snapshot(snapshot_date: str = None, write_db: bool = True):
 
     print(f"[{snapshot_date}] 开始抓取销量快照...")
 
-    # 获取第一页（含 total）
-    first = fetch_page(0, 1)
-    total = first.get("total", 0)
-    total_pages = (total + PER_PAGE - 1) // PER_PAGE
-    print(f"  产品总数: {total}, 总页数: {total_pages}")
+    # 服务站一次拉取全量在线产品（登录态由服务端注入）
+    items, total = fetch_all(1)
+    print(f"  产品总数: {total}, 本次返回: {len(items)} 条")
 
     snapshots = {}  # ASIN → sales data
-    seq = 1
-
-    # 第一页
-    for item in first.get("list", []):
+    for item in items:
         asin = item.get("asin", "")
         if asin:
             _merge_by_asin(snapshots, asin, item)
-    print(f"  第1页: {len(first.get('list', []))} 条")
-
-    # 后续页
-    for page in range(1, total_pages):
-        time.sleep(REQUEST_INTERVAL)
-        offset = page * PER_PAGE
-        seq += 1
-        try:
-            data = fetch_page(offset, seq)
-            items = data.get("list", [])
-            for item in items:
-                asin = item.get("asin", "")
-                if asin:
-                    _merge_by_asin(snapshots, asin, item)
-            print(f"  第{page+1}页 (offset={offset}): {len(items)} 条")
-        except Exception as e:
-            print(f"  第{page+1}页失败: {e}")
-            continue
 
     # 写入文件（备份）
     output = {

@@ -385,6 +385,7 @@ export default function ProductDetailPage() {
             ["FBA可售", fmtNum(product.afn_fulfillable_quantity)],
             ["FBA预留", fmtNum(product.afn_reserved_quantity)],
             ["在途", fmtNum(product.afn_inbound_shipped_quantity)],
+            ["待到货量", fmtNum(product.purchase_on_order)],
             ["不可售", fmtNum(product.afn_unsellable_quantity)],
             ["入库中", fmtNum(product.afn_inbound_working_quantity)],
             ["待发货", fmtNum(product.afn_inbound_receiving_quantity)],

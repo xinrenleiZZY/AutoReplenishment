@@ -2,9 +2,10 @@
 """
 领星箱规（单箱数量）爬虫 — product/lists API
 用法:
-  python scraper/lingxing_box_qty_scraper.py          # 全量抓取+清洗
-  python scraper/lingxing_box_qty_scraper.py --clean   # 仅清洗
-  python scraper/lingxing_box_qty_scraper.py --import  # 仅导入数据库
+  python scraper/lingxing_box_qty_scraper.py             # 全量抓取+原始落库+清洗
+  python scraper/lingxing_box_qty_scraper.py --clean     # 仅清洗
+  python scraper/lingxing_box_qty_scraper.py --raw-import # 仅将 JSONL 原始数据全量落库
+  python scraper/lingxing_box_qty_scraper.py --import    # 仅导入数据库
 """
 
 import requests
@@ -13,6 +14,7 @@ import os
 import sys
 import time
 import logging
+from decimal import Decimal, InvalidOperation
 
 try:
     from dotenv import load_dotenv
@@ -144,9 +146,11 @@ def scrape_all():
     logger.info(f"总数: {total}, 每页: {per_page}, 总页数: {total_pages}")
 
     count = 0
+    all_items = []
     with open(RAW_JSONL_PATH, "w", encoding="utf-8") as f:
         for item in items_first:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            all_items.append(item)
             count += 1
         logger.info(f"offset=0, 已写入 {count} 条")
 
@@ -158,12 +162,14 @@ def scrape_all():
                 items = data.get("list", [])
                 for item in items:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    all_items.append(item)
                     count += 1
                 logger.info(f"offset={offset}, 已写入 {count} 条")
             except Exception as e:
                 logger.error(f"offset={offset} 异常: {e}, 跳过")
 
     logger.info(f"抓取完成! {count} 条 -> {RAW_JSONL_PATH}")
+    store_raw_to_db(all_items)   # 全字段原始数据整体覆盖落库
     clean_box_qty()
 
 
@@ -266,13 +272,102 @@ def clean_box_qty():
 
 
 async def run_sync():
-    """定时任务完整流程: 抓取 → 清洗 → 导入数据库（供 scheduler 每日调用）
+    """定时任务完整流程: 抓取 → 原始落库 → 清洗 → 导入数据库（供 scheduler 每日调用）
 
     与 ASIN 基础信息同步一致，归入每日定时爬取维度。
     cg_box_pcs=0 属于正常（ERP 未填写），只更新 >0 的产品。
     """
-    scrape_all()          # 抓取 + 清洗（同步，内部已调用 clean_box_qty）
+    scrape_all()          # 抓取 + 原始落库 + 清洗（同步，内部已调用 store_raw_to_db/clean_box_qty）
     import_to_db()        # 导入数据库
+
+
+def store_raw_to_db(items: list | None = None):
+    """product/lists 原始全量记录（全字段、不清洗）-> product_lists_raw
+
+    items 为空时从 RAW_JSONL_PATH 读取；本表整体覆盖写入，仅保留最新一份。
+    """
+    if items is None:
+        if not os.path.exists(RAW_JSONL_PATH):
+            logger.error(f"无原始数据: {RAW_JSONL_PATH}")
+            return
+        items = []
+        with open(RAW_JSONL_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    import asyncio
+    asyncio.run(_async_store_raw(items))
+
+
+# ── product_lists_raw 宽表逐字段落库辅助 ──
+# 接口对整型/数值字段会混用「数字」和「数字字符串」（如 '0'、'10531438'）两种形态，
+# 落库前按模型列类型统一转换，避免 asyncpg 类型不匹配。
+def _raw_int(v):
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _raw_num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _raw_row(item: dict, cols: set, int_cols: set, num_cols: set) -> dict:
+    """把接口单条记录映射为宽表一行（逐字段；字段名与接口一致，不做加工）"""
+    row = {}
+    for k, v in item.items():
+        if k not in cols:
+            continue
+        if k in int_cols:
+            row[k] = _raw_int(v)
+        elif k in num_cols:
+            row[k] = _raw_num(v)
+        elif isinstance(v, (dict, list)):
+            row[k] = v          # JSONB 列原样存储
+        elif v is None:
+            row[k] = None
+        elif isinstance(v, str):
+            row[k] = v
+        else:
+            row[k] = str(v)     # 文本列兜底，避免类型不符
+    return row
+
+
+async def _async_store_raw(items: list):
+    sys.path.insert(0, BASE_DIR)
+    from sqlalchemy import BigInteger, Integer, Numeric, delete
+    from app.database import async_session_factory
+    from app.models.product_lists_raw import ProductListsRaw
+
+    model_cols = [c for c in ProductListsRaw.__table__.columns if c.name not in ("id_no", "created_at")]
+    cols = {c.name for c in model_cols}
+    int_cols = {c.name for c in model_cols if isinstance(c.type, (BigInteger, Integer))}
+    num_cols = {c.name for c in model_cols if isinstance(c.type, Numeric)}
+    rows = [_raw_row(item, cols, int_cols, num_cols) for item in items]
+
+    session = async_session_factory()
+    try:
+        async with session:
+            await session.execute(delete(ProductListsRaw))
+            session.add_all([ProductListsRaw(**row) for row in rows])
+            await session.commit()
+            logger.info(f"原始数据入库完成: product_lists_raw 覆盖 {len(rows)} 条 / {len(cols)} 字段")
+    finally:
+        await session.close()
 
 
 def import_to_db():
@@ -330,9 +425,11 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--clean":
             clean_box_qty()
+        elif sys.argv[1] == "--raw-import":
+            store_raw_to_db()
         elif sys.argv[1] == "--import":
             import_to_db()
         else:
-            print(f"用法: python {sys.argv[0]} [--clean|--import]")
+            print(f"用法: python {sys.argv[0]} [--clean|--raw-import|--import]")
     else:
         scrape_all()

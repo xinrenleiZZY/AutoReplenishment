@@ -71,9 +71,80 @@ PARAM_DEFS: dict[str, tuple] = {
 }
 
 
+# 参数 key -> settings 属性名
+# 大量计算代码直接读 settings.XXX（不经 config_service），故需把 DB 已覆盖值写回全局 settings 单例
+SETTINGS_ATTR_MAP: dict[str, str] = {
+    "safe_stock_days": "SAFE_STOCK_DAYS",
+    "sea_slow_days": "SEA_SLOW_DAYS",
+    "sea_peak_days": "SEA_PEAK_DAYS",
+    "air_slow_days": "AIR_SLOW_DAYS",
+    "air_peak_days": "AIR_PEAK_DAYS",
+    "express_slow_days": "EXPRESS_SLOW_DAYS",
+    "express_peak_days": "EXPRESS_PEAK_DAYS",
+    "sea_slow_fee": "SEA_SLOW_FEE",
+    "sea_peak_fee": "SEA_PEAK_FEE",
+    "air_slow_fee": "AIR_SLOW_FEE",
+    "air_peak_fee": "AIR_PEAK_FEE",
+    "express_slow_fee": "EXPRESS_SLOW_FEE",
+    "express_peak_fee": "EXPRESS_PEAK_FEE",
+    "usd_cny_rate": "USD_CNY_RATE",
+    "cost_exchange_rate": "COST_EXCHANGE_RATE",
+    "forecast_months": "FORECAST_MONTHS",
+    "inventory_danger_max_days": "INVENTORY_DANGER_MAX_DAYS",
+    "inventory_low_max_days": "INVENTORY_LOW_MAX_DAYS",
+    "inventory_healthy_max_days": "INVENTORY_HEALTHY_MAX_DAYS",
+    "decoration_buffer_days": "DECORATION_BUFFER_DAYS",
+    "non_decoration_buffer_days": "NON_DECORATION_BUFFER_DAYS",
+    "long_term_safety_factor": "LONG_TERM_SAFETY_FACTOR",
+    "long_term_level_safety_factor": "LONG_TERM_LEVEL_SAFETY_FACTOR",
+    "new_product_acos_max": "NEW_PRODUCT_ACOS_MAX",
+    "new_product_min_selling_days": "NEW_PRODUCT_MIN_SELLING_DAYS",
+    "new_product_trigger_days": "NEW_PRODUCT_TRIGGER_DAYS",
+    "new_product_trigger_min_order": "NEW_PRODUCT_TRIGGER_MIN_ORDER",
+}
+
+
 async def _get_row(session: AsyncSession, key: str) -> ConfigParam | None:
     result = await session.execute(select(ConfigParam).where(ConfigParam.param_key == key))
     return result.scalar_one_or_none()
+
+
+def apply_settings_override(key: str, value) -> bool:
+    """把单个参数值写回全局 settings 单例（仅限 SETTINGS_ATTR_MAP 登记的 key）
+
+    按 settings 属性的真实类型转换（PARAM_DEFS 的类型标注不完全准确，如 usd_cny_rate 实为 float）。
+    """
+    attr = SETTINGS_ATTR_MAP.get(key)
+    if not attr or not hasattr(settings, attr):
+        return False
+    current = getattr(settings, attr)
+    try:
+        if isinstance(current, bool):
+            casted = str(value).strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(current, int):
+            casted = int(float(value))
+        elif isinstance(current, float):
+            casted = float(value)
+        else:
+            casted = str(value)
+    except (ValueError, TypeError):
+        return False
+    setattr(settings, attr, casted)
+    return True
+
+
+async def sync_settings_overrides(session: AsyncSession) -> dict:
+    """把 DB 中已覆盖的参数一次性同步到全局 settings（启动时调用）"""
+    rows = await session.execute(select(ConfigParam))
+    stored = {r.param_key: r.param_value for r in rows.scalars().all()}
+    applied = {}
+    for key in SETTINGS_ATTR_MAP:
+        raw = stored.get(key)
+        if raw is None:
+            continue
+        if apply_settings_override(key, raw):
+            applied[key] = getattr(settings, SETTINGS_ATTR_MAP[key])
+    return applied
 
 
 def _cast(value: str, value_type: str):
@@ -130,6 +201,7 @@ async def set_param(session: AsyncSession, key: str, value) -> dict:
     else:
         row.param_value = str(casted)
     await session.commit()
+    apply_settings_override(key, casted)
     return {"key": key, "value": casted, "default": default, "type": value_type}
 
 

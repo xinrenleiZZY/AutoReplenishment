@@ -18,10 +18,8 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import date, timedelta
 
-import requests
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,9 +28,9 @@ load_dotenv()
 
 from sqlalchemy import delete, select
 
-from app.config import settings
 from app.database import async_session_factory
 from app.models.sales_statistics import SalesStatisticsReport
+from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 API_URL = "https://gw.lingxingerp.com/sales-statistics/report/list"
@@ -40,65 +38,10 @@ PAGE_SIZE = 500      # 接口支持最大每页500条
 REQUEST_INTERVAL = 0.3
 
 
-def _get_headers() -> dict:
-    """领星网页会话接口 headers（优先 config/.env，空则回退内置兜底值）
-
-    可配置项：LX_HEADER_AUTH_TOKEN(auth-token，兼容 LX_AUTH_TOKEN)、
-    LX_HEADER_COMPANY_ID(x-ak-company-id)、LX_HEADER_UID(x-ak-uid)、LX_HEADER_ENV_KEY(x-ak-env-key)
-    """
-    token = settings.LX_HEADER_AUTH_TOKEN or os.getenv("LX_AUTH_TOKEN", "")
-    company_id = settings.LX_HEADER_COMPANY_ID or "90136117059997696"
-    uid = settings.LX_HEADER_UID or "11054904"
-    env_key = settings.LX_HEADER_ENV_KEY or "huizhixin"
+def _build_payload(page: int, start: str, end: str, query_type: str, group_type: str,
+                   seq: int, filter_date_type: str) -> dict:
+    """构造 report/list 请求体；page/pageSize 由服务站 auto_pagination 自动翻页"""
     return {
-        "accept": "application/json, text/plain, */*",
-        "ak-client-type": "web",
-        "ak-origin": "https://huizhixin.lingxing.com",
-        "auth-token": token,
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://huizhixin.lingxing.com",
-        "referer": "https://huizhixin.lingxing.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
-        "x-ak-company-id": company_id,
-        "x-ak-env-key": env_key,
-        "x-ak-language": "zh",
-        "x-ak-platform": "1",
-        "x-ak-request-source": "erp",
-        "x-ak-uid": uid,
-        "x-ak-version": "3.8.9.3.0.185",
-        "x-ak-zid": "1",
-    }
-
-
-def _refresh_token() -> bool:
-    """鉴权失败时调用独立模块刷新 token（CDP 自动登录+捕获）"""
-    global _HEADERS
-    try:
-        from browser_api.lingxing_auth import LingxingAuth
-
-        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
-        token = LingxingAuth(cdp_port=cdp_port).ensure_token()
-        if token:
-            _HEADERS["auth-token"] = token
-            print(f"[INFO] auth-token 已自动刷新: {token[:15]}...")
-            return True
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] 自动刷新 token 失败: {e}")
-    return False
-
-
-_HEADERS = _get_headers()
-_SESSION = requests.Session()
-
-
-def fetch_page(page: int, start: str, end: str, query_type: str, group_type: str,
-               seq: int, filter_date_type: str = "year",
-               allow_refresh: bool = True, attempt: int = 1) -> dict:
-    """获取一页销售统计数据（网络/5xx 重试 3 次退避；鉴权失败自动刷新 token 重试一次）
-
-    filter_date_type: 统计粒度，year=按年区间（默认）；day=按日区间（可用于近30天实抓）
-    """
-    payload = {
         "queryType": query_type,
         "groupType": group_type,
         "filterDateType": filter_date_type,
@@ -110,28 +53,23 @@ def fetch_page(page: int, start: str, end: str, query_type: str, group_type: str
         "pageSize": PAGE_SIZE,
         "req_time_sequence": f"/sales-statistics/report/list$${seq}",
     }
-    try:
-        resp = _SESSION.post(API_URL, headers=_HEADERS, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        collect_raw("sales_statistics", data, url=API_URL, method="POST",
-                    params=payload, status_code=resp.status_code)
-    except (requests.RequestException, ValueError) as e:
-        if attempt < 3:
-            print(f"[WARN] 第{page}页请求失败(尝试{attempt}/3): {e}，{2 * attempt}s 后重试...")
-            time.sleep(2 * attempt)
-            return fetch_page(page, start, end, query_type, group_type, seq,
-                              filter_date_type, allow_refresh, attempt + 1)
-        raise
-    if data.get("code") != 1:
-        err = f"API error: code={data.get('code')}, msg={data.get('msg')}"
-        if allow_refresh and (str(data.get("code")) == "8003" or "鉴权" in str(data.get("msg"))):
-            print(f"[WARN] 鉴权失败({err})，尝试自动刷新 token...")
-            if _refresh_token():
-                return fetch_page(page, start, end, query_type, group_type, seq,
-                                  filter_date_type, allow_refresh=False)
-        raise Exception(err)
-    return data.get("data", {}) or {}
+
+
+def fetch_all(start: str, end: str, query_type: str, group_type: str,
+              filter_date_type: str = "year", seq: int = 1) -> tuple[list[dict], int]:
+    """经领星 API 服务站一次拉取全量销售统计（登录态由服务端注入，自动翻页）
+
+    filter_date_type: 统计粒度，year=按年区间（默认）；day=按日区间（可用于近30天实抓）
+    服务端 auto_pagination 自动翻 page/pageSize；返回 data 即扁平行列表。
+    """
+    body = _build_payload(1, start, end, query_type, group_type, seq, filter_date_type)
+    resp = station_proxy(url=API_URL, body=body, auto_pagination=True)
+    collect_raw("sales_statistics", resp, url=API_URL, method="POST", params=body)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[销售统计report/list]调用失败: {resp.get('message')}")
+    lst = [it for it in (resp.get("data") or []) if isinstance(it, dict)]
+    total = int(resp.get("total") or len(lst))
+    return lst, total
 
 
 def _s(v):
@@ -196,42 +134,32 @@ async def sync_sales_statistics(start: str, end: str, query_type: str, group_typ
     """抓取并落库，返回统计（filter_date_type: year=按年；day=按日区间如近30天）"""
     stats = {"total": 0, "pages": 0, "written": 0, "skipped_empty": 0, "errors": []}
     seq = 1
-    page = 1
     records = []
 
-    while True:
-        try:
-            data = fetch_page(page, start, end, query_type, group_type, seq, filter_date_type)
-        except Exception as e:  # noqa: BLE001
-            print(f"[ERROR] 第{page}页抓取失败: {e}")
-            stats["errors"].append(f"page{page}: {e}")
-            break
-        lst = data.get("list") or []
-        stats["pages"] += 1
-        stats["total"] += len(lst)
-        print(f"  第{page}页: {len(lst)} 条 (count={data.get('count')})")
+    try:
+        lst, total = fetch_all(start, end, query_type, group_type, filter_date_type, seq)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ERROR] 抓取失败: {e}")
+        stats["errors"].append(str(e))
+        return stats
 
-        for item in lst:
-            if not isinstance(item, dict):
-                continue
-            ext = _extract(item)
-            if not ext["asin"]:
-                stats["skipped_empty"] += 1
-                continue
-            ext["stat_start_date"] = start
-            ext["stat_end_date"] = end
-            ext["query_type"] = query_type
-            ext["group_type"] = group_type
-            ext["fetch_date"] = date.today()
-            records.append(ext)
+    stats["pages"] = 1
+    stats["total"] = total
+    print(f"  服务站一次拉取: {len(lst)} 条 (total={total})")
 
-        count = int(data.get("count") or 0)
-        offset = int(data.get("offset") or 0)
-        if len(lst) < PAGE_SIZE or (count and offset + len(lst) >= count):
-            break
-        page += 1
-        seq += 1
-        time.sleep(REQUEST_INTERVAL)
+    for item in lst:
+        if not isinstance(item, dict):
+            continue
+        ext = _extract(item)
+        if not ext["asin"]:
+            stats["skipped_empty"] += 1
+            continue
+        ext["stat_start_date"] = start
+        ext["stat_end_date"] = end
+        ext["query_type"] = query_type
+        ext["group_type"] = group_type
+        ext["fetch_date"] = date.today()
+        records.append(ext)
 
     # 同一 ASIN 可能挂在多个 sid/seller_sku 组合下重复返回：按 ASIN 去重，保留 total 值最大的记录
     best = {}

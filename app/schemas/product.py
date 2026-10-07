@@ -108,6 +108,7 @@ class ProductResponse(BaseModel):
     afn_inbound_working_quantity: Optional[int] = None
     afn_inbound_receiving_quantity: Optional[int] = None
     quantity: Optional[int] = None
+    purchase_on_order: Optional[int] = None
     # 排名与表现
     rank: Optional[int] = None
     seller_rank: Optional[int] = None

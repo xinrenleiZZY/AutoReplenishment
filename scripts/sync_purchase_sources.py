@@ -11,27 +11,34 @@
   - 采购单看板：data 为 {list:[...], total:N}，逐条落库 purchase_order_board。
   - 幂等：每次全量抓取先删除表内旧数据再写入（每天完整数据入库，每天更新）。
 
-说明：本脚本负责「两个数据源完整落库」，并基于落库数据计算「ASIN 待到货量」：
-      步骤1 采购计划明细(待采购/部分采购)品名 → plan_sn；
-      步骤2 plan_sn → 采购单看板 relation_plan → wait_quantity；
-      计算结果替换写入 products/inventory_snapshots.purchase_on_order。
-      看板时间窗口默认最近7天，可用 --board-start/--board-end 覆盖。
+说明：本脚本负责「两个数据源完整落库」，并基于落库数据按「品名」汇总计算「ASIN 待到货量」：
+      步骤1 最近3个月采购计划明细(status_text ∈ 已完成/待采购/部分采购) →
+            品名 → [(plan_sn, status_text, quantity_plan)]，一个品名对应 n 个计划编号；
+      步骤2 逐个计划编号按状态分支取值：
+            - 待采购/部分采购：待到货量 = 计划采购量(quantity_plan)，累加；
+            - 已完成：plan_sn → 采购单看板 relation_plan → wait_quantity
+                      (同一 plan_sn 在看板有多行时按 product_lists_raw.cg_price
+                       取最贵那一行，不求和；全部取不到价格才回退求和)，存在即累加；
+      步骤3 合计该品名的待到货量，写回对应产品的 purchase_on_order。
+     匹配侧（系统产品）只按品名取最终数值，取不到即为 0（不再有降级兜底逻辑）。
+      看板时间窗口默认最近3个月（月份-3），可用 --board-start/--board-end 覆盖；--board-all 取全历史（不限时间）。
 
 用法：
   python scripts/sync_purchase_sources.py              # 全量抓取+写库
   python scripts/sync_purchase_sources.py --dry-run    # 只抓取统计不写库
+  python scripts/sync_purchase_sources.py --board-all  # 采购单看板抓全历史（不限时间）
 """
 
 import argparse
+import calendar
 import json
 import os
 import re
 import sys
-import time
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date
+from decimal import Decimal
 
-import requests
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,41 +54,44 @@ from app.models.inventory import InventorySnapshot
 from app.models.purchase_plan_items import PurchasePlanItem
 from app.models.purchase_order_board import PurchaseOrderBoard
 from app.models.product import Product
+from app.models.product_lists_raw import ProductListsRaw
+from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 PLAN_NEW_URL = "https://huizhixin.lingxing.com/api/module/purchase/plan/listNew"
 BOARD_URL = "https://huizhixin.lingxing.com/api/purchase_report/purchaseOrderBoard"
-PAGE_SIZE = 500          # 每页拉取条数
-REQUEST_INTERVAL = 0.3   # 翻页间隔，避免限流
-MAX_PAGES = 200          # 防死循环上限
+PAGE_SIZE = 500          # auto_pagination 翻页步长（供服务站逐页拉取）
 
-# 采购单看板抓取时间窗口（time_type=1），默认最近7天；start_date/end_date 可显式覆盖
-BOARD_LOOKBACK_DAYS = 7
-# 待到货量口径：步骤1 采购计划明细状态（待采购 + 部分采购）
-PLAN_WAIT_STATUSES = ("待采购", "部分采购")
+# 采购单看板抓取时间窗口（time_type=1），默认最近3个月（月份-3）；start_date/end_date 可显式覆盖
+BOARD_LOOKBACK_MONTHS = 3
+# --board-all 时看板起始日期（早于任何业务数据，等效“不限时间”全历史）
+BOARD_ALL_START = "2000-01-01"
+# 待到货量口径：采购计划时间维度=最近3个月（按外层分组 create_time 过滤）
+PLAN_LOOKBACK_MONTHS = 3
+# 参与计算的采购计划状态（其他状态舍去）
+PLAN_STATUSES = ("已完成", "待采购", "部分采购")
+# 其中「直接取计划采购量」的状态；其余(已完成)走采购单看板取 wait_quantity
+PLAN_DIRECT_STATUSES = ("待采购", "部分采购")
 
 
-def _get_headers() -> dict:
-    token = os.getenv("LX_AUTH_TOKEN", "")
-    return {
-        "accept": "application/json, text/plain, */*",
-        "ak-client-type": "web",
-        "ak-origin": "https://huizhixin.lingxing.com",
-        "auth-token": token,
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://huizhixin.lingxing.com",
-        "referer": "https://huizhixin.lingxing.com/erp/msupply/purchasePlan",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0.0.0 Safari/537.36",
-        "x-ak-company-id": "90136117059997696",
-        "x-ak-env-key": "huizhixin",
-        "x-ak-language": "zh",
-        "x-ak-platform": "1",
-        "x-ak-request-source": "erp",
-        "x-ak-uid": "11054904",
-        "x-ak-version": "3.9.0.3.0.089",
-        "x-ak-zid": "1",
-        "baggage": "sentry-environment=production,sentry-release=3.9.0.3",
-    }
+def _months_ago(n: int, ref: date | None = None) -> date:
+    """返回 ref（缺省今天）往前 n 个月的日期（月份-3口径：按日对齐，跨月不足则取当月最后一天）"""
+    ref = ref or date.today()
+    y, m = ref.year, ref.month - n
+    while m <= 0:
+        m += 12
+        y -= 1
+    return date(y, m, min(ref.day, calendar.monthrange(y, m)[1]))
+
+
+def _within_lookback(create_time: str | None, cutoff: date) -> bool:
+    """create_time(如 '2026-09-28 15:13:23') 是否在 cutoff 之后（含当日）"""
+    if not create_time:
+        return False
+    try:
+        return date.fromisoformat(str(create_time).strip()[:10]) >= cutoff
+    except ValueError:
+        return False
 
 
 def _board_payload(offset: int, length: int, seq: int, start_date: str, end_date: str) -> dict:
@@ -94,12 +104,15 @@ def _board_payload(offset: int, length: int, seq: int, start_date: str, end_date
     }
 
 
-def _board_window(start_date: str | None, end_date: str | None) -> tuple[str, str]:
-    """看板时间窗口：缺省默认最近 BOARD_LOOKBACK_DAYS 天"""
+def _board_window(start_date: str | None, end_date: str | None,
+                  all_time: bool = False) -> tuple[str, str]:
+    """看板时间窗口：all_time=True 取全历史（BOARD_ALL_START 起）；否则缺省最近 BOARD_LOOKBACK_MONTHS 个月（月份-3）"""
     end = (end_date or date.today().isoformat()).strip()
+    if all_time:
+        return BOARD_ALL_START, end
     if start_date:
         return start_date.strip(), end
-    start = (date.fromisoformat(end) - timedelta(days=BOARD_LOOKBACK_DAYS - 1)).isoformat()
+    start = _months_ago(BOARD_LOOKBACK_MONTHS, date.fromisoformat(end)).isoformat()
     return start, end
 
 
@@ -115,89 +128,62 @@ def _plan_new_payload(offset: int, length: int, seq: int) -> dict:
     }
 
 
-def _post(url, payload, headers, source):
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    collect_raw(source, data, url=url, method="POST", params=payload, status_code=resp.status_code)
-    if data.get("code") != 1:
-        raise RuntimeError(f"API error: code={data.get('code')} msg={data.get('msg')}")
-    return data.get("data") or {}
-
-
 # ── 采购单看板 ──
-def fetch_board(headers, start_date: str | None = None, end_date: str | None = None) -> tuple[list[dict], int]:
-    """全量抓取采购单看板，返回 (list, total)"""
-    rows = []
-    total = 0
-    offset = 0
-    seq = 1
+def fetch_board(start_date: str | None = None, end_date: str | None = None) -> tuple[list[dict], int]:
+    """全量抓取采购单看板，返回 (扁平行列表, total)
+
+    经领星 API 服务站转发（登录态由服务端注入），auto_pagination 一次拉全量；
+    服务端返回的 data 即扁平行列表。
+    """
     s_date, e_date = _board_window(start_date, end_date)
-    for _ in range(MAX_PAGES):
-        data = _post(BOARD_URL, _board_payload(offset, PAGE_SIZE, seq, s_date, e_date), headers, "purchase_order_board")
-        lst = data.get("list") or []
-        total = int(data.get("total") or 0)
-        for it in lst:
-            if isinstance(it, dict):
-                rows.append(it)
-        if len(lst) < PAGE_SIZE or (total and offset + len(lst) >= total):
-            break
-        offset += len(lst)
-        seq += 1
-        time.sleep(REQUEST_INTERVAL)
-    else:
-        print("[WARN] 采购单看板超过分页上限，已截断")
+    body = _board_payload(0, PAGE_SIZE, 1, s_date, e_date)
+    resp = station_proxy(url=BOARD_URL, body=body, auto_pagination=True)
+    collect_raw("purchase_order_board", resp, url=BOARD_URL, method="POST", params=body)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[采购单看板]调用失败: {resp.get('message')}")
+    rows = [it for it in (resp.get("data") or []) if isinstance(it, dict)]
+    total = int(resp.get("total") or len(rows))
     return rows, total
 
 
 # ── 采购计划(listNew 接口2：items 直接含 product_name/status_text/plan_sn) ──
-def fetch_plan_new(headers) -> list[dict]:
+def fetch_plan_new() -> list[dict]:
     """全量抓取采购计划 listNew，返回所有 items 平铺列表
 
-    listNew 响应顶层为 {list:[分组], total:N}，total 为分组数；每组含 items 明细。
-    按 offset/length 分页抓取分组，把各组 items 平铺返回（并附上外层分组信息）。
+    经领星 API 服务站转发（登录态由服务端注入），auto_pagination 一次拉全量；
+    服务端返回的 data 即分组数组（每组含 items 明细），逐组平铺并附外层分组信息。
     """
+    body = _plan_new_payload(0, PAGE_SIZE, 1)
+    resp = station_proxy(url=PLAN_NEW_URL, body=body, auto_pagination=True)
+    collect_raw("purchase_plan_new", resp, url=PLAN_NEW_URL, method="POST", params=body)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[采购计划listNew]调用失败: {resp.get('message')}")
+    grp_list = resp.get("data") or []
     rows = []
-    offset = 0
-    seq = 1
-    total = 0
-    for _ in range(MAX_PAGES):
-        payload = _plan_new_payload(offset, PAGE_SIZE, seq)
-        resp = requests.post(PLAN_NEW_URL, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        j = resp.json()
-        collect_raw("purchase_plan_new", j, url=PLAN_NEW_URL, method="POST", params=payload, status_code=resp.status_code)
-        if j.get("code") != 1:
-            raise RuntimeError(f"API error: code={j.get('code')} msg={j.get('msg')}")
-        grp_list = j.get("list") or []
-        total = int(j.get("total") or 0)
-        for g in grp_list:
-            gid = _to_int(g.get("id"))
-            ppg_sn = g.get("ppg_sn")
-            ppg_sn_id = g.get("ppg_sn_id")
-            g_status = _to_int(g.get("group_status"))
-            for it in (g.get("items") or []):
-                if not isinstance(it, dict):
-                    continue
-                it = dict(it)
-                it["_group_id"] = gid
-                it["_ppg_sn"] = ppg_sn
-                it["_ppg_sn_id"] = ppg_sn_id
-                it["_group_status"] = g_status
-                rows.append(it)
-        if len(grp_list) < PAGE_SIZE or (total and offset + len(grp_list) >= total):
-            break
-        offset += len(grp_list)
-        seq += 1
-        time.sleep(REQUEST_INTERVAL)
-    else:
-        print("[WARN] 采购计划(listNew)超过分页上限，已截断")
+    for g in grp_list:
+        if not isinstance(g, dict):
+            continue
+        gid = _to_int(g.get("id"))
+        ppg_sn = g.get("ppg_sn")
+        ppg_sn_id = g.get("ppg_sn_id")
+        g_status = _to_int(g.get("group_status"))
+        g_create_time = g.get("create_time")
+        for it in (g.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            it = dict(it)
+            it["_group_id"] = gid
+            it["_ppg_sn"] = ppg_sn
+            it["_ppg_sn_id"] = ppg_sn_id
+            it["_group_status"] = g_status
+            it["_create_time"] = g_create_time
+            rows.append(it)
     return rows
 
 
-async def sync_purchase_plan_items(headers, stats, dry_run):
+async def sync_purchase_plan_items(stats, dry_run):
     """抓取采购计划 listNew 并落库 purchase_plan_items"""
-    rows = fetch_plan_new(headers)
+    rows = fetch_plan_new()
     stats["plan_items_total"] = len(rows)
     print(f"采购计划(listNew): {len(rows)} 条明细")
 
@@ -213,6 +199,7 @@ async def sync_purchase_plan_items(headers, stats, dry_run):
             "ppg_sn": it.get("_ppg_sn"),
             "ppg_sn_id": it.get("_ppg_sn_id"),
             "group_id": it.get("_group_id"),
+            "create_time": it.get("_create_time"),
             "product_id": _to_int(it.get("product_id")),
             "product_name": it.get("product_name"),
             "product_model": it.get("product_model"),
@@ -265,11 +252,12 @@ def _to_int(v):
         return None
 
 
-async def sync_purchase_board(headers, stats, dry_run,
-                              start_date: str | None = None, end_date: str | None = None):
+async def sync_purchase_board(stats, dry_run,
+                              start_date: str | None = None, end_date: str | None = None,
+                              all_time: bool = False):
     """抓取采购单看板并落库"""
-    s_date, e_date = _board_window(start_date, end_date)
-    lst, total = fetch_board(headers, start_date=s_date, end_date=e_date)
+    s_date, e_date = _board_window(start_date, end_date, all_time=all_time)
+    lst, total = fetch_board(start_date=s_date, end_date=e_date)
     stats["board_window"] = f"{s_date}~{e_date}"
     stats["board_total"] = total
     stats["board_records"] = len(lst)
@@ -317,71 +305,145 @@ async def sync_purchase_board(headers, stats, dry_run,
     print(f"已写入 purchase_order_board {len(records)} 条（{fetch_date}）")
 
 
-# ── ASIN 待到货量（精准口径） ──
-async def _plan_wait_sn_by_name(session) -> dict[str, set[str]]:
-    """步骤1：采购计划明细(待采购/部分采购) → 品名 → plan_sn 集合"""
+# ── ASIN 待到货量（品名级汇总口径） ──
+async def _plan_3m_by_name(session, cutoff: date) -> dict[str, list[tuple[str, str, int]]]:
+    """步骤1：最近3个月采购计划明细(已完成/待采购/部分采购) → 品名 → [(plan_sn, status_text, quantity_plan)]
+
+    1个品名可对应 n 个计划编号(plan_sn)，由步骤2按状态分支取值后合计。
+    时间维度按外层分组 create_time 过滤（cutoff 之前舍去）。
+    """
     rows = (await session.execute(
-        select(PurchasePlanItem.product_name, PurchasePlanItem.plan_sn)
-        .where(PurchasePlanItem.status_text.in_(PLAN_WAIT_STATUSES))
+        select(
+            PurchasePlanItem.product_name,
+            PurchasePlanItem.plan_sn,
+            PurchasePlanItem.status_text,
+            PurchasePlanItem.quantity_plan,
+            PurchasePlanItem.create_time,
+        )
+        .where(PurchasePlanItem.status_text.in_(PLAN_STATUSES))
         .where(PurchasePlanItem.plan_sn.isnot(None))
     )).all()
-    m: dict[str, set[str]] = defaultdict(set)
-    for pname, plan_sn in rows:
-        if pname:
-            m[pname.strip()].add(str(plan_sn).strip())
+    m: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+    for pname, plan_sn, status_text, qty, create_time in rows:
+        if not pname or not _within_lookback(create_time, cutoff):
+            continue
+        m[pname.strip()].append((str(plan_sn).strip(), status_text, int(qty or 0)))
     return m
 
 
 async def _board_wait_by_plan(session) -> dict[str, int]:
-    """步骤2：采购单看板 → relation_plan → wait_quantity 汇总"""
+    """步骤2：采购单看板 → relation_plan → wait_quantity
+
+    看板为子件级明细：同一 relation_plan 下会同时出现主产品与子件(说明书/背卡/松紧绳等)
+    多行，且各行的 wait_quantity 完全相同，直接相加会成倍重复计数。
+    规则：用每行 product_name 去 product_lists_raw 查 cg_price(同名取最贵)，
+          取 cg_price 最大那一行的 wait_quantity；
+          若该 plan_sn 下所有行都查不到价格，则回退为原始求和。
+    """
     rows = (await session.execute(
-        select(PurchaseOrderBoard.relation_plan, PurchaseOrderBoard.wait_quantity)
+        select(
+            PurchaseOrderBoard.relation_plan,
+            PurchaseOrderBoard.product_name,
+            PurchaseOrderBoard.wait_quantity,
+        )
         .where(PurchaseOrderBoard.relation_plan.isnot(None))
     )).all()
-    m: dict[str, int] = defaultdict(int)
-    for rp, wq in rows:
+
+    price_rows = (await session.execute(
+        select(ProductListsRaw.product_name, ProductListsRaw.cg_price)
+        .where(ProductListsRaw.product_name.isnot(None))
+        .where(ProductListsRaw.cg_price.isnot(None))
+    )).all()
+    price_by_name: dict[str, Decimal] = {}
+    for pname, price in price_rows:
+        key = str(pname).strip()
+        if key not in price_by_name or price > price_by_name[key]:
+            price_by_name[key] = price
+
+    grouped: dict[str, list[tuple[str | None, int]]] = defaultdict(list)
+    for rp, pname, wq in rows:
         if rp:
-            m[str(rp).strip()] += (wq or 0)
+            grouped[str(rp).strip()].append((pname, wq or 0))
+
+    m: dict[str, int] = {}
+    for key, items in grouped.items():
+        if len(items) == 1:
+            m[key] = items[0][1]
+            continue
+        best_idx = -1
+        best_price: Decimal | None = None
+        for i, (pname, _) in enumerate(items):
+            price = price_by_name.get(str(pname).strip()) if pname else None
+            if price is None:
+                continue
+            if best_price is None or price > best_price:
+                best_price = price
+                best_idx = i
+        if best_idx >= 0:
+            m[key] = items[best_idx][1]
+        else:
+            m[key] = sum(w for _, w in items)
     return m
 
 
 async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
-    """ASIN 待到货量（精准口径），替换 purchase_on_order。
+    """ASIN 待到货量（品名级汇总口径），替换 purchase_on_order。
 
-    步骤1：本系统ASIN品名 = 采购计划明细品名(product_name)，
-           状态 待采购/部分采购(status_text)，取 plan_sn。
-    步骤2：用 plan_sn 匹配 采购单看板 relation_plan，取 wait_quantity。
+    步骤1：最近3个月采购计划明细(已完成/待采购/部分采购) → 品名 → [(plan_sn, status, qty)]。
+    步骤2：逐个计划编号按状态分支取值并累加：
+           - 待采购/部分采购：待到货量 = 计划采购量(quantity_plan)；
+           - 已完成：plan_sn → 采购单看板 relation_plan → wait_quantity（存在即累加）。
+    步骤3：合计该品名待到货量，写回对应产品的 purchase_on_order（取不到即 0）。
     """
+    cutoff = _months_ago(PLAN_LOOKBACK_MONTHS)
     async with async_session_factory() as s:
-        name_to_plans = await _plan_wait_sn_by_name(s)
+        name_plans = await _plan_3m_by_name(s, cutoff)
         plan_to_wait = await _board_wait_by_plan(s)
         prods = (await s.execute(
             select(Product.asin, Product.product_name)
         )).all()
 
-    stats = {
-        "plan_names": len(name_to_plans),
-        "board_plans": len(plan_to_wait),
-    }
+    # 步骤2+3：品名 → 待到货量（各计划编号按状态分支取值后合计）
+    wait_by_name: dict[str, int] = {}
+    direct_plans = 0      # 待采购/部分采购：直接取计划采购量
+    board_plans = 0       # 已完成：命中采购单看板
+    for key, plans in name_plans.items():
+        total = 0
+        for plan_sn, status_text, qty in plans:
+            if status_text in PLAN_DIRECT_STATUSES:
+                total += qty
+                direct_plans += 1
+            else:
+                w = plan_to_wait.get(plan_sn)
+                if w:
+                    total += w
+                    board_plans += 1
+        wait_by_name[key] = total
+
+    # 匹配侧：系统产品按品名直接取最终数值，取不到即 0
     wait_by_asin: dict[str, int] = {}
-    matched_plan_sum = 0
     for asin, pname in prods:
         if not pname:
             continue
-        plans = name_to_plans.get(pname.strip())
-        if not plans:
-            continue
-        total = sum(plan_to_wait.get(psn, 0) for psn in plans)
-        if total > 0:
-            wait_by_asin[asin] = total
-            matched_plan_sum += len(plans)
+        qty = wait_by_name.get(pname.strip(), 0)
+        if qty > 0:
+            wait_by_asin[asin] = qty
 
-    stats["matched_asins"] = len(wait_by_asin)
-    stats["wait_total"] = sum(wait_by_asin.values())
-    stats["matched_plans"] = matched_plan_sum
-    stats["sample"] = sorted(wait_by_asin.items(), key=lambda x: -x[1])[:10]
-    print(f"ASIN待到货量: 采购计划品名 {len(name_to_plans)} 个、看板计划 {len(plan_to_wait)} 个；"
-          f"匹配 ASIN {len(wait_by_asin)} 个，合计 {stats['wait_total']}")
+    stats = {
+        "cutoff": cutoff.isoformat(),
+        "plan_names": len(name_plans),
+        "plan_links": sum(len(v) for v in name_plans.values()),
+        "board_plans": len(plan_to_wait),
+        "direct_plans": direct_plans,
+        "board_hit_plans": board_plans,
+        "matched_asins": len(wait_by_asin),
+        "wait_total": sum(wait_by_asin.values()),
+        "sample": sorted(wait_by_asin.items(), key=lambda x: -x[1])[:10],
+    }
+    print(f"ASIN待到货量: 采购计划品名 {len(name_plans)} 个(计划编号 {stats['plan_links']} 个)、"
+          f"看板计划 {len(plan_to_wait)} 个；按状态取值：待采购/部分采购 {direct_plans} 个、"
+          f"已完成命中看板 {board_plans} 个；匹配 ASIN {len(wait_by_asin)} 个，"
+          f"合计 {stats['wait_total']}（{cutoff} 起）")
     for asin, qty in stats["sample"]:
         print(f"  {asin}: 待到货 {qty}")
 
@@ -421,16 +483,16 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
     return stats
 
 
-async def main(dry_run: bool = False, board_start: str | None = None, board_end: str | None = None) -> dict:
-    headers = _get_headers()
+async def main(dry_run: bool = False, board_start: str | None = None, board_end: str | None = None,
+               board_all: bool = False) -> dict:
     stats = {"dry_run": dry_run}
     try:
-        await sync_purchase_plan_items(headers, stats, dry_run)
+        await sync_purchase_plan_items(stats, dry_run)
     except Exception as e:
         stats["plan_items_error"] = str(e)
         print(f"[ERROR] 采购计划(listNew)同步失败: {e}")
     try:
-        await sync_purchase_board(headers, stats, dry_run, start_date=board_start, end_date=board_end)
+        await sync_purchase_board(stats, dry_run, start_date=board_start, end_date=board_end, all_time=board_all)
     except Exception as e:
         stats["board_error"] = str(e)
         print(f"[ERROR] 采购单看板同步失败: {e}")
@@ -449,7 +511,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="领星 采购计划+采购单看板 抓取")
     parser.add_argument("--dry-run", action="store_true", help="只抓取不写库")
-    parser.add_argument("--board-start", default=None, help="看板抓取起始日期(yyyy-mm-dd)，缺省默认最近7天")
+    parser.add_argument("--board-start", default=None, help="看板抓取起始日期(yyyy-mm-dd)，缺省默认最近3个月")
     parser.add_argument("--board-end", default=None, help="看板抓取结束日期(yyyy-mm-dd)，缺省今天")
+    parser.add_argument("--board-all", action="store_true", help="采购单看板抓取全历史（不限时间，起始 2000-01-01，优先于 --board-start）")
     args = parser.parse_args()
-    asyncio.run(main(args.dry_run, board_start=args.board_start, board_end=args.board_end))
+    asyncio.run(main(args.dry_run, board_start=args.board_start, board_end=args.board_end,
+                     board_all=args.board_all))

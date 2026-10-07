@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """待到货量同步（首选通道：领星库存明细 api/storage/lists 的 pending_num）
 
-数据源：POST https://huizhixin.lingxing.com/api/storage/lists
+数据源：领星 库存明细 api/storage/lists（经「领星 API 服务站」转发，登录态由服务端注入）
 字段：pending_num = 待到货量（每条库存明细一个 SKU/品名）
 
 匹配：品名清洗后精确匹配优先 → SKU(local_sku/msku/fnsku) 精确匹配兜底。
@@ -20,7 +20,6 @@ import sys
 from collections import defaultdict
 from datetime import date
 
-import requests
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +32,7 @@ from sqlalchemy import select, update  # noqa: E402
 from app.database import async_session_factory  # noqa: E402
 from app.models.inventory import InventorySnapshot  # noqa: E402
 from app.models.product import Product  # noqa: E402
+from app.services.lx_station import station_proxy  # noqa: E402
 from scripts.sync_purchase_orders import (  # noqa: E402
     clean_product_name,
     match_sub_item_asin,
@@ -40,96 +40,29 @@ from scripts.sync_purchase_orders import (  # noqa: E402
 from app.services.raw_store import collect_raw, flush_raw  # noqa: E402
 
 API_URL = "https://huizhixin.lingxing.com/api/storage/lists"
-PAGE_SIZE = 500
+PAGE_SIZE = 500  # auto_pagination 翻页步长（供服务站逐页拉取）
 # 只统计以下仓库的待到货（同和/久辉/义乌），其他仓库忽略
 ALLOWED_WAREHOUSES = ("同和", "久辉", "义乌")
 
 
-def _get_headers():
-    token = os.getenv("LX_AUTH_TOKEN", "")
-    return {
-        "accept": "application/json, text/plain, */*",
-        "ak-client-type": "web",
-        "ak-origin": "https://huizhixin.lingxing.com",
-        "auth-token": token,
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://huizhixin.lingxing.com",
-        "referer": "https://huizhixin.lingxing.com/erp/msupply/warehouseDetail",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
-        "x-ak-company-id": "90136117059997696",
-        "x-ak-env-key": "huizhixin",
-        "x-ak-language": "zh",
-        "x-ak-platform": "1",
-        "x-ak-request-source": "erp",
-        "x-ak-uid": "11054904",
-        "x-ak-version": "3.9.0.3.0.018",
-        "x-ak-zid": "1",
-    }
-
-
-HEADERS = _get_headers()
-
-
-def _refresh_token() -> bool:
-    """鉴权失败时自动刷新 token（CDP 登录+捕获）"""
-    global HEADERS
-    try:
-        from browser_api.lingxing_auth import LingxingAuth
-
-        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
-        token = LingxingAuth(cdp_port=cdp_port).ensure_token()
-        if token:
-            HEADERS["auth-token"] = token
-            print(f"[INFO] auth-token 已自动刷新: {token[:15]}...")
-            return True
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] 自动刷新 token 失败: {e}")
-    return False
-
-
-def fetch_page(offset: int, seq: int, allow_refresh: bool = True) -> dict:
-    """获取一页库存明细（pending_num=待到货量）"""
+def fetch_all_items() -> list:
+    """经领星 API 服务站拉取全量库存明细（auto_pagination），data 即扁平行列表"""
     payload = {
         "wid_list": "", "mid_list": "", "sid_list": "", "inventoryOwnership": -1,
         "cid_list": "", "bid_list": "", "principal_list": "", "product_type_list": "",
         "product_attribute": "", "product_status": "", "search_field": "product_name",
         "search_value": "", "is_sku_merge_show": 0, "is_hide_zero_stock": 0,
-        "offset": offset, "length": PAGE_SIZE, "sort_field": "", "sort_type": "",
+        "offset": 0, "length": PAGE_SIZE, "sort_field": "", "sort_type": "",
         "gtag_ids": "", "senior_search_list": "[]", "permission_uid_list": "",
         "country_code_list": "", "has_statistic": False,
-        "req_time_sequence": f"/api/storage/lists$${seq}",
+        "req_time_sequence": "/api/storage/lists$$1",
     }
-    resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    collect_raw("storage_lists", data, url=API_URL, method="POST",
-                params=payload, status_code=resp.status_code)
-    if data.get("code") != 1:
-        err = f"API error: code={data.get('code')}, msg={data.get('msg')}"
-        if allow_refresh and (str(data.get("code")) == "8003" or "鉴权" in str(data.get("msg") or "")):
-            print(f"[WARN] 鉴权失败({err})，尝试自动刷新 token...")
-            if _refresh_token():
-                return fetch_page(offset, seq, allow_refresh=False)
-        raise RuntimeError(err)
-    return data.get("data") or {}
-
-
-def fetch_all_items() -> list:
-    """分页拉取全量库存明细（先完整拉取再落库，页面失败即抛错走兜底通道）"""
-    items = []
-    seq = 1
-    offset = 0
-    first = fetch_page(0, seq)
-    total = int(first.get("total") or 0)
-    items.extend(first.get("list") or [])
-    while len(items) < total:
-        seq += 1
-        offset += PAGE_SIZE
-        page = fetch_page(offset, seq)
-        lst = page.get("list") or []
-        if not lst:
-            break
-        items.extend(lst)
+    resp = station_proxy(url=API_URL, body=payload, auto_pagination=True)
+    collect_raw("storage_lists", resp, url=API_URL, method="POST", params=payload)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[库存明细]调用失败: {resp.get('message')}")
+    items = [it for it in (resp.get("data") or []) if isinstance(it, dict)]
+    total = int(resp.get("total") or len(items))
     if total and len(items) < total:
         raise RuntimeError(f"库存明细拉取不完整（{len(items)}/{total}），中止写入，走兜底通道")
     return items

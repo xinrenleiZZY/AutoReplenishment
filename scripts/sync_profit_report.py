@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """领星经营利润报表毛利率抓取脚本（bd/profit/report/report/asin/list 网页API）
 
-数据源：领星网页 API https://gw.lingxingerp.com/bd/profit/report/report/asin/list
+数据源：领星 经营利润报表 API bd/profit/report/report/asin/list（经「领星 API 服务站」转发，登录态由服务端注入）
 功能：按单日（startDate=endDate）抓取全部 ASIN 的经营利润报表，写入 profit_report_stats 表。
   - 需求口径：data.records.asins 对应系统 ASIN，data.records.grossRate 即毛利率（0~1，如 0.3806=38.06%）。
-  - 分页：接口用 offset/length（非 page/pageSize），响应 data.total 为总条数。
+  - 分页：接口用 offset/length（非 page/pageSize），服务站 auto_pagination 一次拉全量。
   - 幂等：按 stat_date 先删旧数据再全量写入（每天完整数据入库，每天更新）。
   - 整条原始响应 raw_data 兜底（保证不丢字段）。
 
@@ -19,10 +19,8 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import date, timedelta
 
-import requests
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,70 +29,18 @@ load_dotenv()
 
 from sqlalchemy import delete
 
-from app.config import settings
 from app.database import async_session_factory
 from app.models.profit_report_stat import ProfitReportStat
+from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 API_URL = "https://gw.lingxingerp.com/bd/profit/report/report/asin/list"
-PAGE_SIZE = 100       # 接口每页条数（length），可按需调整
-REQUEST_INTERVAL = 0.3
+PAGE_SIZE = 100       # 接口每页条数（length），auto_pagination 翻页步长
 SEQ_START = 1         # req_time_sequence 序号
 
 # 默认公司/市场参数（用户提供的网页接口参数）
 DEFAULT_MIDS = [1]
 DEFAULT_SIDS = []
-
-
-def _get_headers() -> dict:
-    """领星网页会话接口 headers（优先 config/.env，空则回退内置兜底值）
-
-    可配置项：LX_HEADER_AUTH_TOKEN(auth-token，兼容 LX_AUTH_TOKEN)、
-    LX_HEADER_COMPANY_ID(x-ak-company-id)、LX_HEADER_UID(x-ak-uid)、LX_HEADER_ENV_KEY(x-ak-env-key)
-    """
-    token = settings.LX_HEADER_AUTH_TOKEN or os.getenv("LX_AUTH_TOKEN", "")
-    company_id = settings.LX_HEADER_COMPANY_ID or "90136117059997696"
-    uid = settings.LX_HEADER_UID or "11054904"
-    env_key = settings.LX_HEADER_ENV_KEY or "huizhixin"
-    return {
-        "accept": "application/json, text/plain, */*",
-        "ak-client-type": "web",
-        "ak-origin": "https://huizhixin.lingxing.com",
-        "auth-token": token,
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://huizhixin.lingxing.com",
-        "referer": "https://huizhixin.lingxing.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
-        "x-ak-company-id": company_id,
-        "x-ak-env-key": env_key,
-        "x-ak-language": "zh",
-        "x-ak-platform": "1",
-        "x-ak-request-source": "erp",
-        "x-ak-uid": uid,
-        "x-ak-version": "3.9.0.3.0.089",
-        "x-ak-zid": "1",
-    }
-
-
-def _refresh_token() -> bool:
-    """鉴权失败时调用独立模块刷新 token（CDP 自动登录+捕获）"""
-    global _HEADERS
-    try:
-        from browser_api.lingxing_auth import LingxingAuth
-
-        cdp_port = int(os.getenv("LX_CDP_PORT", "18800"))
-        token = LingxingAuth(cdp_port=cdp_port).ensure_token()
-        if token:
-            _HEADERS["auth-token"] = token
-            print(f"[INFO] auth-token 已自动刷新: {token[:15]}...")
-            return True
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] 自动刷新 token 失败: {e}")
-    return False
-
-
-_HEADERS = _get_headers()
-_SESSION = requests.Session()
 
 
 def _build_payload(stat_date: str, offset: int, length: int, seq: int,
@@ -126,36 +72,18 @@ def _build_payload(stat_date: str, offset: int, length: int, seq: int,
     }
 
 
-def fetch_report(stat_date: str, offset: int, length: int, seq: int,
-                 mids: list | None = None, sids: list | None = None,
-                 allow_refresh: bool = True, attempt: int = 1) -> dict:
-    """获取一页经营利润报表数据（网络/5xx 重试 3 次退避；鉴权失败自动刷新 token 重试一次）
+def fetch_all_records(stat_date: str, page_size: int = PAGE_SIZE,
+                      mids: list | None = None, sids: list | None = None) -> list[dict]:
+    """经领星 API 服务站拉取指定日期全部经营利润报表记录（auto_pagination）
 
-    返回 data 子对象：{records: [...], total: N}。异常时抛 Exception。
+    服务端自动注入登录态；data 即扁平记录列表（每条含 asins/grossRate/...）。
     """
-    payload = _build_payload(stat_date, offset, length, seq, mids, sids)
-    try:
-        resp = _SESSION.post(API_URL, headers=_HEADERS, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        collect_raw("profit_report", data, url=API_URL, method="POST",
-                    params=payload, status_code=resp.status_code)
-    except (requests.RequestException, ValueError) as e:
-        if attempt < 3:
-            print(f"[WARN] offset={offset} 请求失败(尝试{attempt}/3): {e}，{2 * attempt}s 后重试...")
-            time.sleep(2 * attempt)
-            return fetch_report(stat_date, offset, length, seq, mids, sids,
-                                allow_refresh, attempt + 1)
-        raise
-    if data.get("code") != 1:
-        err = f"API error: code={data.get('code')}, msg={data.get('msg')}"
-        if allow_refresh and (str(data.get("code")) == "8003" or "鉴权" in str(data.get("msg"))):
-            print(f"[WARN] 鉴权失败({err})，尝试自动刷新 token...")
-            if _refresh_token():
-                return fetch_report(stat_date, offset, length, seq, mids, sids,
-                                    allow_refresh=False)
-        raise Exception(err)
-    return data.get("data", {}) or {}
+    payload = _build_payload(stat_date, 0, page_size, SEQ_START, mids, sids)
+    resp = station_proxy(url=API_URL, body=payload, auto_pagination=True)
+    collect_raw("profit_report", resp, url=API_URL, method="POST", params=payload)
+    if not resp.get("success"):
+        raise RuntimeError(f"服务站[经营利润报表]调用失败: {resp.get('message')}")
+    return [it for it in (resp.get("data") or []) if isinstance(it, dict)]
 
 
 def _to_float(v):
@@ -202,39 +130,25 @@ async def sync_profit_report(stat_date: str, dry_run: bool = False, page_size: i
     """
     stats = {"date": stat_date, "total": 0, "pages": 0, "written": 0,
              "skipped_empty": 0, "errors": []}
-    seq = SEQ_START
-    offset = 0
     records = []
 
-    while True:
-        try:
-            data = fetch_report(stat_date, offset, page_size, seq, mids, sids)
-        except Exception as e:  # noqa: BLE001
-            print(f"[ERROR] offset={offset} 抓取失败: {e}")
-            stats["errors"].append(f"offset{offset}: {e}")
-            break
-        lst = data.get("records") or []
-        stats["pages"] += 1
-        stats["total"] += len(lst)
-        total = int(data.get("total") or 0)
-        print(f"  offset={offset}: {len(lst)} 条 (total={total})")
+    try:
+        lst = fetch_all_records(stat_date, page_size, mids, sids)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ERROR] {stat_date} 抓取失败: {e}")
+        stats["errors"].append(str(e))
+        lst = []
+    stats["pages"] = 1
+    stats["total"] = len(lst)
+    print(f"  {stat_date}: {len(lst)} 条")
 
-        for item in lst:
-            if not isinstance(item, dict):
-                continue
-            ext = _extract(item)
-            if not ext["asin"]:
-                stats["skipped_empty"] += 1
-                continue
-            ext["stat_date"] = date.fromisoformat(stat_date)
-            records.append(ext)
-
-        offset += len(lst)
-        seq += 1
-        # 终止条件：本页返回不足一页，或已遍历完 total
-        if len(lst) < page_size or (total and offset >= total):
-            break
-        time.sleep(REQUEST_INTERVAL)
+    for item in lst:
+        ext = _extract(item)
+        if not ext["asin"]:
+            stats["skipped_empty"] += 1
+            continue
+        ext["stat_date"] = date.fromisoformat(stat_date)
+        records.append(ext)
 
     if dry_run:
         print(f"\n[dry-run] 共抓取 {stats['total']} 条（未写库）")

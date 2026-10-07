@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   api,
@@ -127,6 +127,7 @@ export default function CalculationPage() {
   const [visibility, setVisibility] = useState<Record<string, boolean>>(loadVisibility);
   const [showColumns, setShowColumns] = useState(false);
   const [analyzing, setAnalyzing] = useState<Record<string, boolean>>({});
+  const [sending, setSending] = useState<Record<string, boolean>>({});
   const [feedbackTarget, setFeedbackTarget] = useState<OverviewItem | null>(null);
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackSaving, setFeedbackSaving] = useState(false);
@@ -134,12 +135,22 @@ export default function CalculationPage() {
   const [excludeTarget, setExcludeTarget] = useState<OverviewItem | null>(null);
   const [excludeSaving, setExcludeSaving] = useState(false);
 
+  // 行内操作触发列表刷新时，保留当前滚动位置（窗口 + 表格内部），避免刷新后跳回顶部
+  const tableWrapRef = useRef<HTMLDivElement | null>(null);
+  const scrollRestoreRef = useRef<{ win: number; tbl: number } | null>(null);
+
   useEffect(() => {
     const t = setTimeout(() => setDebounced(keyword.trim()), 300);
     return () => clearTimeout(t);
   }, [keyword]);
 
-  const load = useCallback(() => {
+  const load = useCallback((opts?: { keepScroll?: boolean }) => {
+    if (opts?.keepScroll) {
+      scrollRestoreRef.current = {
+        win: typeof window !== "undefined" ? window.scrollY : 0,
+        tbl: tableWrapRef.current?.scrollTop ?? 0,
+      };
+    }
     setLoading(true);
     api.calculation
       .overview({
@@ -161,6 +172,18 @@ export default function CalculationPage() {
   }, [debounced, operatorFilter, productLevelFilter, lifeCycleFilter, levelFilter, calcDateFilter, page, pageSize]);
 
   useEffect(() => { load(); }, [load]);
+
+  // 刷新完成后，把之前记录的滚动位置恢复回去（DOM 更新后再执行）
+  useEffect(() => {
+    const snap = scrollRestoreRef.current;
+    if (!snap || loading) return;
+    scrollRestoreRef.current = null;
+    const raf = requestAnimationFrame(() => {
+      if (tableWrapRef.current) tableWrapRef.current.scrollTop = snap.tbl;
+      if (typeof window !== "undefined") window.scrollTo(0, snap.win);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [data, loading, notice]);
 
   // 列表状态写入 sessionStorage：点开 ASIN 详情返回后可恢复筛选与分页
   useEffect(() => {
@@ -214,7 +237,7 @@ export default function CalculationPage() {
       if (job.status === "failed") throw new Error(job.error || "计算失败");
       setBatchStats(job.stats);
       api.calculation.dueStats().then(setDueStats).catch(() => null);
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "按频率计算失败");
     } finally {
@@ -238,7 +261,7 @@ export default function CalculationPage() {
       const job = await api.calculation.getJob(res.job_id);
       if (job.status === "failed") throw new Error(job.error || "计算失败");
       setBatchStats(job.stats);
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "批量计算失败");
     } finally {
@@ -267,11 +290,34 @@ export default function CalculationPage() {
       } else {
         setNotice("分析完成");
       }
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "计算失败");
     } finally {
       setAnalyzing(prev => ({ ...prev, [asin]: false }));
+    }
+  };
+
+  const sendNow = async (asin: string) => {
+    setSending(prev => ({ ...prev, [asin]: true }));
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.calculation.notify(asin);
+      // 仅提示不刷新列表，但提示卡片会插入表格上方，记录滚动位置以便恢复
+      scrollRestoreRef.current = {
+        win: typeof window !== "undefined" ? window.scrollY : 0,
+        tbl: tableWrapRef.current?.scrollTop ?? 0,
+      };
+      if (res.notify?.sent) {
+        setNotice(`已将 ${asin} 的分析报告私发给负责人「${res.notify.operator}」（${res.calc_date || ""}）`);
+      } else {
+        setNotice(`未发送：${res.notify?.reason || "未知原因"}`);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "发送失败");
+    } finally {
+      setSending(prev => ({ ...prev, [asin]: false }));
     }
   };
 
@@ -296,7 +342,7 @@ export default function CalculationPage() {
         operator: feedbackTarget.primary_operator || undefined,
       });
       setFeedbackTarget(null);
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "反馈保存失败");
     } finally {
@@ -318,7 +364,7 @@ export default function CalculationPage() {
         confidence: 95,
       });
       setNotice(`已${item.adopted ? "取消" : "采纳"} ${item.asin}${item.calc_date ? `（${item.calc_date.slice(0, 10)}）` : ""} 的分析结果`);
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "采纳失败");
     } finally {
@@ -335,7 +381,7 @@ export default function CalculationPage() {
       const res = await api.products.asinListAction("exclude", [excludeTarget.asin]);
       setNotice(`已排除 ${excludeTarget.asin}（状态变更 ${res.status_changed} 条），10 分钟内自动刷新状态`);
       setExcludeTarget(null);
-      load();
+      load({ keepScroll: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "排除失败");
     } finally {
@@ -502,7 +548,7 @@ export default function CalculationPage() {
         <div className="card text-center py-12" style={{ color: "var(--text-tertiary)" }}>暂无数据</div>
       )}
       {data && data.items.length > 0 && (
-        <div className="card overflow-auto" style={{ maxHeight: "calc(100vh - 240px)" }}>
+        <div ref={tableWrapRef} className="card overflow-auto" style={{ maxHeight: "calc(100vh - 240px)" }}>
           <table className="w-full text-sm">
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-color)" }}>
@@ -550,6 +596,15 @@ export default function CalculationPage() {
                   })}
                   <td className="py-2 text-center" onClick={e => e.stopPropagation()}>
                     <div className="flex gap-1 justify-center">
+                      <button
+                        onClick={() => sendNow(item.asin)}
+                        disabled={sending[item.asin]}
+                        className="px-2 py-1 rounded text-xs font-medium text-white"
+                        style={{ backgroundColor: sending[item.asin] ? "#94a3b8" : "var(--accent-blue, #2563eb)" }}
+                        title="不重新计算，直接把该 ASIN 最新一次分析报告私发给负责人"
+                      >
+                        {sending[item.asin] ? "发送中" : "立刻发送"}
+                      </button>
                       <button
                         onClick={() => analyzeOne(item.asin)}
                         disabled={analyzing[item.asin]}

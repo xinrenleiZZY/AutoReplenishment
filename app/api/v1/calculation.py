@@ -15,6 +15,7 @@ from app.database import get_session
 from app.models.calculation import CalculationResult, CalculationStepResult, CalculationTimelineReset
 from app.models.product import Product
 from app.models.operator import Operator
+from app.models.ai_evaluation import AiEvaluation
 from app.schemas.calculation import CalculationResultResponse, FeedbackRequest, AdoptRequest, TimelineResetRequest
 from app.tasks.calculation_tasks import (
     run_single_calculation,
@@ -1061,6 +1062,136 @@ async def trigger_single_calculation(
         "message": f"ASIN {asin} 计算完成",
         "data": result,
         "notify": notify,
+    }
+
+
+async def _load_latest_result_for_notify(asin: str, session: AsyncSession) -> dict | None:
+    """从库中还原某 ASIN 最新一次计算结果的完整字典（用于「立刻发送」不重算、直接私发）"""
+    row = (await session.execute(
+        select(CalculationResult)
+        .where(CalculationResult.asin == asin)
+        .order_by(CalculationResult.calc_date.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if row is None:
+        return None
+
+    prod = (await session.execute(
+        select(Product).where(Product.asin == asin)
+    )).scalar_one_or_none()
+
+    # AI 评估：取该 ASIN 最新一次成功的采购评估（与计算结果同源）
+    ai_analysis = None
+    ai_row = (await session.execute(
+        select(AiEvaluation.output_data)
+        .where(
+            AiEvaluation.asin == asin,
+            AiEvaluation.eval_type == "purchase_advice",
+            AiEvaluation.status == "success",
+        )
+        .order_by(AiEvaluation.created_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if ai_row:
+        ai_analysis = _parse_json(ai_row)
+        if not isinstance(ai_analysis, dict):
+            ai_analysis = None
+
+    # 成本表（与 /cost-table 接口同口径重算）
+    cost_table = None
+    cost_ok, cost_reason = None, ""
+    try:
+        from app.services import new_product_policy
+        from app.tasks.calculation_tasks import _get_new_product_cfg
+        from app.models.product_cost import ProductCost
+
+        if prod is not None:
+            cfg = await _get_new_product_cfg(session)
+            cost_row = (await session.execute(
+                select(ProductCost).where(ProductCost.asin == asin)
+            )).scalar_one_or_none()
+            override = {}
+            if cost_row is not None:
+                override = {
+                    k: getattr(cost_row, k)
+                    for k in (
+                        "price", "cost_cny", "exchange_rate", "length_cm", "width_cm", "height_cm",
+                        "weight_kg", "freight_sea_cny", "freight_air_cny", "freight_express_cny",
+                        "sorting_fee", "referral_fee", "packing_fee", "inbound_fee", "storage_fee",
+                        "ad_fee", "return_loss", "over_threshold_loss", "misc_fee", "notes",
+                    )
+                    if getattr(cost_row, k) is not None
+                }
+            cost_table = new_product_policy.calc_cost_table(prod, cfg=cfg, override=override)
+            cost_ok, cost_reason = new_product_policy.check_cost_table(cost_table)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("还原成本表失败 ASIN=%s: %s", asin, e)
+        cost_table = None
+
+    # 历史对比趋势
+    history_rows = (await session.execute(
+        select(CalculationResult)
+        .where(CalculationResult.asin == asin)
+        .order_by(CalculationResult.calc_date)
+    )).scalars().all()
+    history = [
+        {
+            "calc_date": r.calc_date.isoformat(),
+            "purchase_score": r.purchase_score,
+            "suggested_qty": r.suggested_qty,
+            "inventory_days": r.inventory_days,
+            "purchase_level": r.purchase_level,
+            "purchase_trigger": r.purchase_trigger,
+        }
+        for r in history_rows
+    ]
+
+    batch_plan = _parse_json(row.batch_plan)
+    if not isinstance(batch_plan, dict):
+        batch_plan = {}
+    score_detail = _parse_json(row.score_detail)
+
+    return {
+        "asin": asin,
+        "product_name": prod.product_name if prod else None,
+        "calc_date": row.calc_date.isoformat(),
+        "life_cycle": row.life_cycle,
+        "forecast_total": row.forecast_total,
+        "available_stock": row.available_stock,
+        "inventory_days": row.inventory_days,
+        "replenishment_cycle": row.replenishment_cycle,
+        "urgency_score": row.urgency_score,
+        "purchase_trigger": row.purchase_trigger,
+        "suggested_qty": row.suggested_qty,
+        "batch_plan": batch_plan,
+        "purchase_score": row.purchase_score,
+        "purchase_level": row.purchase_level,
+        "score_detail": score_detail,
+        "ai_analysis": ai_analysis,
+        "reason": "",
+        "cost_table": cost_table,
+        "cost_check": {"ok": cost_ok, "reason": cost_reason},
+        "history": history,
+    }
+
+
+@router.post("/trigger/{asin}/notify")
+async def notify_single_result(asin: str, session: AsyncSession = Depends(get_session)):
+    """将某 ASIN 最新一次分析报告私发给对应运营负责人（不重算，仅发送）"""
+    result = await _load_latest_result_for_notify(asin, session)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"ASIN {asin} 暂无计算结果，请先执行「立即分析」")
+    notify = await _notify_operator_private(asin, result, session)
+    if not notify.get("sent"):
+        return {
+            "message": f"未发送：{notify.get('reason', '未知原因')}",
+            "notify": notify,
+            "calc_date": result["calc_date"],
+        }
+    return {
+        "message": f"已将 {asin}（{result['calc_date']}）的分析报告私发给负责人「{notify.get('operator')}」",
+        "notify": notify,
+        "calc_date": result["calc_date"],
     }
 
 

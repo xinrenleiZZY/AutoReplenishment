@@ -85,7 +85,7 @@ async def get_transport_days(
 
     if session is not None:
         try:
-            config_key = f"transport_{mode}_{'peak' if is_peak_season else 'slow'}_days"
+            config_key = f"{mode}_{'peak' if is_peak_season else 'slow'}_days"
             query = select(ConfigParam).where(ConfigParam.param_key == config_key)
             result = await session.execute(query)
             config_row = result.scalar_one_or_none()

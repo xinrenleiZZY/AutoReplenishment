@@ -132,6 +132,27 @@ def fetch_page(offset: int, req_seq: int, begin_date: str = "", end_date: str = 
         payload["begin_date"] = begin_date
     if end_date:
         payload["end_date"] = end_date
+
+    # 首选「领星 API 服务站」：登录态由服务端注入，规避本地 auth-token 被顶号（8003/-999）
+    try:
+        from app.services.lx_station import station_proxy
+
+        station_resp = station_proxy(url=API_URL, body=payload)
+        if isinstance(station_resp, dict) and station_resp.get("success"):
+            items = [it for it in (station_resp.get("data") or []) if isinstance(it, dict)]
+            try:
+                from app.services.raw_store import collect_raw
+
+                collect_raw("showOnline_scraper", station_resp, url=API_URL, method="POST",
+                            params=payload, status_code=200)
+            except Exception:  # noqa: BLE001
+                pass
+            return {"list": items, "total": int(station_resp.get("total") or len(items))}
+        print(f"[WARN] 服务站抓取未成功({str(station_resp)[:200]})，回退本地直连")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 服务站抓取失败({e})，回退本地直连")
+
+    # 兜底：本地 auth-token 直连
     resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()

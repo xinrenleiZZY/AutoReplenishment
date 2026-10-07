@@ -21,6 +21,14 @@ async def lifespan(app: FastAPI):
     # 启动时
     await init_db()
     try:
+        from app.services.config_service import sync_settings_overrides
+
+        async with async_session_factory() as session:
+            applied = await sync_settings_overrides(session)
+        logger.info(f"启动时自定义参数同步到 settings 完成: {applied}")
+    except Exception as e:
+        logger.error(f"启动时自定义参数同步失败: {e}")
+    try:
         from app.services.operator_sync import sync_operators_from_products
 
         async with async_session_factory() as session:

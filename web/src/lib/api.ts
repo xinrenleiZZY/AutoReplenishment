@@ -889,6 +889,11 @@ export const api = {
         `/api/v1/calculation/trigger/${asin}`,
         { method: "POST" }
       ),
+    notify: (asin: string) =>
+      fetchJSON<{ message: string; notify: { sent: boolean; reason?: string; operator?: string }; calc_date?: string }>(
+        `/api/v1/calculation/trigger/${asin}/notify`,
+        { method: "POST" }
+      ),
     triggerBatch: () =>
       fetchJSON<{ message: string; job_id: string; status: string }>("/api/v1/calculation/trigger/batch", { method: "POST" }),
     dueStats: () => fetchJSON<DueStats>("/api/v1/calculation/due-stats"),

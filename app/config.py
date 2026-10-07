@@ -30,10 +30,23 @@ class Settings(BaseSettings):
     LOGISTICS_API_TIMEOUT: float = 15.0
 
     # ── 领星网页会话接口 headers（抽到 config/.env，便于后续填；空则回退脚本内兜底值）
+    LX_AUTH_TOKEN: str = ""          # 领星网页 auth-token（本地直连兜底；服务站不可用时启用）
     LX_HEADER_AUTH_TOKEN: str = ""   # auth-token（兼容独立 LX_AUTH_TOKEN）
     LX_HEADER_COMPANY_ID: str = ""   # x-ak-company-id
     LX_HEADER_UID: str = ""          # x-ak-uid
     LX_HEADER_ENV_KEY: str = ""      # x-ak-env-key
+
+    # ── 本地 CDP 兜底刷新（服务站不可用时，接入本机浏览器登录领星并捕获 auth-token） ──
+    LX_USERNAME: str = ""            # 领星账号（CDP 自动登录）
+    LX_PASSWORD: str = ""            # 领星密码
+    LX_CDP_HOST: str = "127.0.0.1"   # CDP 浏览器主机（容器内用 host.docker.internal）
+    LX_CDP_PORT: int = 18800         # CDP 调试端口
+
+    # ── 领星 API 服务站（首选通道：登录态由服务端注入，摆脱本地 auth-token 顶号问题） ──
+    LX_STATION_BASE_URL: str = ""     # 服务站地址，如 http://192.168.40.194:7788
+    LX_STATION_USER_ID: str = ""      # 服务站账号
+    LX_STATION_PASSWORD: str = ""     # 服务站密码
+    LX_STATION_TIMEOUT: float = 600.0  # 单次 /api/proxy 超时秒数
 
     # 飞书通知（应用机器人方式优先）
     FEISHU_APP_ID: Optional[str] = None
