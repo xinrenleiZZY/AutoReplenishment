@@ -109,7 +109,7 @@ async def run_assign_levels(session, mode: str | None = None, dry_run: bool = Fa
     """全量/部分产品分级：老品 → 去年总销量；新品 → 节日生命周期年预测（非节日新品等级空着）。
     写回 product_stage（新老品）、product_level、calc_frequency。返回等级分布。"""
     from app.services.config_service import get_param
-    from app.services.product_stage import is_new_product_basic
+    from app.services.product_stage import OLD_TAGS_DEFAULT, is_new_product_basic
 
     if mode is None:
         mode = (await get_param(session, "product_level_mode")) or "mixed"
@@ -128,6 +128,7 @@ async def run_assign_levels(session, mode: str | None = None, dry_run: bool = Fa
     thirty = await get_latest_snapshot_volumes(session, asins)
     annualized = {a: round(thirty.get(a, 0) * ANNUALIZE) for a in asins}
     new_keywords = (await get_param(session, "new_product_name_keywords")) or "26版,27版"
+    old_tags = (await get_param(session, "product_type_old_tags")) or OLD_TAGS_DEFAULT
 
     # 去年总销量（老品 / 方案D）
     last_year_sales = {}
@@ -186,7 +187,7 @@ async def run_assign_levels(session, mode: str | None = None, dry_run: bool = Fa
     final_vol: dict = {}
     for p in products:
         annual = annualized.get(p.asin, 0)
-        is_new = is_new_product_basic(p, new_keywords)
+        is_new = is_new_product_basic(p, new_keywords, old_tags)
         if mode == "mixed":
             if not is_new:
                 vol = (stat_last_year_sales.get(p.asin, 0)
@@ -219,7 +220,7 @@ async def run_assign_levels(session, mode: str | None = None, dry_run: bool = Fa
     s_list.sort(key=lambda x: -x[1])
     print(f"\nS级产品 {len(s_list)} 个，TOP10:")
     for p, vol in s_list[:10]:
-        stage = "新品" if (p.list_date and (date.today() - p.list_date).days <= 365) else "老品"
+        stage = "新品" if is_new_product_basic(p, new_keywords, old_tags) else "老品"
         print(f"  {p.asin} | {p.product_name[:45]} | 销量={vol} | {stage} | list={p.list_date}")
     return stats
 

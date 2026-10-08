@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_session
+from app.database import async_session_factory, get_session
 from app.models.calculation import CalculationResult, CalculationStepResult, CalculationTimelineReset
 from app.models.product import Product
 from app.models.operator import Operator
@@ -28,6 +28,7 @@ from app.tasks.calculation_tasks import (
     _latest_calculation_rows,
     reset_calculation_timeline,
     normalize_level,
+    _normalize_levels,
 )
 from app.integrations.feishu import FeishuNotifier
 from app.services import config_service
@@ -810,10 +811,16 @@ async def trigger_due_calculation():
 
 
 @router.post("/trigger/level/{level}")
-async def trigger_level_calculation(level: str):
+async def trigger_level_calculation(
+    level: str,
+    lifecycles: Optional[str] = Query(None, description="按生命周期过滤，逗号分隔，如 启动期,增长期,热卖期；不传=全部"),
+):
     """立即计算指定等级（S/A/B/C/D），忽略频率（异步任务，含实时进度）"""
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(lambda: run_level_calculation(level, progress=progress), progress=progress)
+    job_id = _start_job(
+        lambda: run_level_calculation(level, progress=progress, lifecycles=lifecycles),
+        progress=progress,
+    )
     return {
         "message": f"{level.upper()} 级计算已提交",
         "job_id": job_id,
@@ -1037,31 +1044,69 @@ async def _notify_operator_private(asin: str, result: dict, session: AsyncSessio
     return {"sent": False, "reason": "飞书应用机器人未配置", "operator": primary}
 
 
+async def _run_single_with_sync(asin: str, progress: dict | None = None) -> dict:
+    """手动分析流程：先全量重拉三项数据（销量/库存/待到货量）→ 单品计算 → 私发负责人
+
+    三项同步为全量同步（与定时任务同源同口径），耗时较长，故整体作为后台任务执行并回报进度。
+    """
+    from app.tasks.sync_tasks import sync_sales_data, sync_inventory, sync_purchase_orders
+
+    steps = [
+        ("同步销量数据", sync_sales_data),
+        ("同步库存数据", sync_inventory),
+        ("同步待到货量", sync_purchase_orders),
+    ]
+    total_steps = len(steps) + 1
+    if progress is not None:
+        progress["total"] = total_steps
+        progress["done"] = 0
+        progress["percent"] = 0
+        progress["current_asin"] = asin
+        progress["stage"] = steps[0][0]
+
+    for i, (name, fn) in enumerate(steps):
+        if progress is not None:
+            progress["stage"] = name
+        try:
+            await fn()
+        except Exception as e:  # noqa: BLE001
+            logger.error("手动分析前%s失败 ASIN=%s: %s", name, asin, e)
+        if progress is not None:
+            progress["done"] = i + 1
+            progress["percent"] = round((i + 1) / total_steps * 100)
+
+    if progress is not None:
+        progress["stage"] = "计算分析"
+
+    stats: dict = {"asin": asin}
+    async with async_session_factory() as session:
+        result = await run_single_calculation(asin, session)
+        await session.commit()
+
+        if result.get("skipped"):
+            stats.update({"skipped": True, "reason": result.get("reason")})
+        elif "error" in result:
+            stats.update({"error": result["error"]})
+        else:
+            # 计算成功后，私发分析结果给对应运营负责人（失败不阻断）
+            stats["notify"] = await _notify_operator_private(asin, result, session)
+
+    if progress is not None:
+        progress["done"] = total_steps
+        progress["percent"] = 100
+        progress["stage"] = None
+    return stats
+
+
 @router.post("/trigger/{asin}")
-async def trigger_single_calculation(
-    asin: str,
-    session: AsyncSession = Depends(get_session),
-):
-    """手动触发单个ASIN计算（计算成功后私发结果给对应运营负责人）"""
-    result = await run_single_calculation(asin, session)
-    await session.commit()
-
-    if result.get("skipped"):
-        return {
-            "message": f"ASIN {asin} 跳过分析：{result.get('reason', '基础数据缺失')}",
-            "skipped": True,
-            "reason": result.get("reason"),
-        }
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-
-    # 计算成功后，私发分析结果给对应运营负责人（失败不阻断）
-    notify = await _notify_operator_private(asin, result, session)
-
+async def trigger_single_calculation(asin: str):
+    """手动触发单个ASIN计算：先全量重拉三项数据（销量/库存/待到货量），再计算并私发负责人"""
+    progress = {"total": 0, "done": 0, "percent": 0, "current_asin": asin, "stage": None}
+    job_id = _start_job(lambda: _run_single_with_sync(asin, progress=progress), progress=progress)
     return {
-        "message": f"ASIN {asin} 计算完成",
-        "data": result,
-        "notify": notify,
+        "message": f"ASIN {asin} 已提交：正在重拉三项数据后分析",
+        "job_id": job_id,
+        "status": "running",
     }
 
 
@@ -1255,3 +1300,187 @@ async def push_daily_report(session: AsyncSession = Depends(get_session)):
             "pause_count": summary["pause_count"],
         },
     }
+
+
+# ==================== 任务大厅（自定义任务） ====================
+
+async def _run_multi_asin_task(levels: str, lifecycles: str | None, with_report: bool,
+                               with_image: bool, progress: dict | None = None) -> dict:
+    """任务大厅-多ASIN任务：按「等级 + 生命周期」立即计算，可选生成并推送日报/大屏大图"""
+    stats = await run_level_calculation(levels, progress=progress, lifecycles=lifecycles)
+    result: dict = {
+        "levels": levels,
+        "lifecycles": lifecycles,
+        "calc": {k: stats.get(k) for k in ("total", "success", "failed", "immediate", "observe", "pause")},
+    }
+    if not with_report:
+        return result
+
+    if progress is not None:
+        progress["stage"] = "生成并推送日报"
+    async with async_session_factory() as session:
+        summary = await get_daily_summary(session, levels=levels, lifecycles=lifecycles)
+        if ai_eval.ai_enabled():
+            try:
+                summary = await ai_eval.generate_daily_report_ai(summary, session)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("AI 日报生成失败，使用规则日报推送: %s", e)
+        whitelist = await config_service.get_param(session, "feishu_group_whitelist") or ""
+    chat_ids = [c.strip() for c in str(whitelist).split(",") if c.strip()]
+    notifier = FeishuNotifier(chat_ids=chat_ids or None)
+    if not notifier.app_mode and not notifier.webhook_url:
+        result["report"] = {"sent": False, "reason": "飞书通知未配置"}
+        return result
+    ok = await notifier.send_daily_report(summary)
+    image_ok = False
+    if ok and with_image and notifier.app_mode:
+        try:
+            from app.services.report_image import generate_and_send
+
+            image_ok = await generate_and_send(notifier)
+        except Exception as e:  # noqa: BLE001
+            logger.error("日报大屏图片发送失败: %s", e)
+    result["report"] = {
+        "sent": ok,
+        "image_sent": image_ok,
+        "total_asins": summary.get("total_asins"),
+        "immediate_count": summary.get("immediate_count"),
+        "observe_count": summary.get("observe_count"),
+        "pause_count": summary.get("pause_count"),
+    }
+    if progress is not None:
+        progress["stage"] = None
+    return result
+
+
+@router.post("/task-hall/multi")
+async def trigger_task_hall_multi(
+    levels: str = Query(..., description="产品等级，如 SA / S,A,B"),
+    lifecycles: Optional[str] = Query(None, description="生命周期，逗号分隔，如 启动期,增长期,热卖期；不传=全部"),
+    with_report: bool = Query(True, description="是否生成并推送日报到飞书"),
+    with_image: bool = Query(False, description="是否附带推送日报大屏大图（需 with_report=true）"),
+):
+    """任务大厅-多ASIN任务：立即按「等级 + 生命周期」跑完整流程（计算 → 日报 → 推送）"""
+    if not _normalize_levels(levels):
+        raise HTTPException(status_code=400, detail=f"无效产品等级: {levels}，支持 S/A/B/C/D")
+    progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None, "stage": "计算"}
+    job_id = _start_job(
+        lambda: _run_multi_asin_task(levels, lifecycles, with_report, with_image, progress),
+        progress=progress,
+    )
+    return {"message": "多ASIN任务已提交", "job_id": job_id, "status": "running"}
+
+
+# 任务大厅-单ASIN定时私发任务（内存登记；API 重启后待执行任务丢失，需重新创建）
+_single_tasks: dict[str, dict] = {}
+
+
+async def _run_single_notify_task(task: dict) -> None:
+    """执行单ASIN报告私发任务：全量重拉三项数据 → 计算 → 私发负责人"""
+    task["status"] = "running"
+    task["started_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        task["stats"] = await _run_single_with_sync(task["asin"])
+        task["status"] = "done"
+    except Exception as e:  # noqa: BLE001
+        task["status"] = "failed"
+        task["error"] = str(e)
+        logger.error("任务大厅单ASIN任务执行失败 ASIN=%s: %s", task["asin"], e)
+    finally:
+        task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+@router.post("/task-hall/single")
+async def create_task_hall_single(
+    asin: str = Query(..., description="ASIN"),
+    operator: Optional[str] = Query(None, description="负责人姓名；填写时需与该ASIN产品负责人一致，防止发错人"),
+    run_at: Optional[str] = Query(None, description="定时执行时间（ISO，如 2026-10-08T09:00）；不传=立即执行"),
+    session: AsyncSession = Depends(get_session),
+):
+    """任务大厅-单ASIN报告私发任务：立即或定时私发某 ASIN 分析结果给负责人"""
+    asin = (asin or "").strip()
+    if not asin:
+        raise HTTPException(status_code=400, detail="ASIN 不能为空")
+    product = (await session.execute(
+        select(Product).where(Product.asin == asin)
+    )).scalar_one_or_none()
+    if product is None:
+        raise HTTPException(status_code=404, detail=f"未找到 ASIN {asin}")
+
+    from app.services.operator_sync import clean_operator_name
+
+    product_operator = clean_operator_name(product.primary_operator)
+    op = (operator or "").strip()
+    if op and op != product_operator:
+        raise HTTPException(
+            status_code=400,
+            detail=f"负责人不匹配：ASIN {asin} 实际负责人为「{product_operator or '未配置'}」，与所选「{op}」不一致",
+        )
+
+    task_id = uuid.uuid4().hex[:12]
+    task = {
+        "id": task_id,
+        "asin": asin,
+        "operator": op or product_operator,
+        "product_operator": product_operator,
+        "run_at": run_at,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "started_at": None,
+        "finished_at": None,
+        "stats": None,
+        "error": None,
+    }
+
+    if run_at:
+        from apscheduler.triggers.date import DateTrigger
+
+        from app.tasks.scheduler import get_scheduler
+
+        scheduler = get_scheduler()
+        if scheduler is None:
+            raise HTTPException(status_code=503, detail="调度器未启动，无法创建定时任务")
+        try:
+            run_dt = datetime.fromisoformat(run_at)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="定时时间格式不正确（应为 ISO，如 2026-10-08T09:00）")
+        if run_dt <= datetime.now():
+            raise HTTPException(status_code=400, detail="定时时间需晚于当前时间")
+        _single_tasks[task_id] = task
+        scheduler.add_job(
+            _run_single_notify_task,
+            trigger=DateTrigger(run_date=run_dt),
+            args=[task],
+            id=f"task_hall_single_{task_id}",
+            name=f"单ASIN私发 {asin}",
+            replace_existing=True,
+        )
+        return {"message": f"定时任务已创建，将于 {run_dt:%Y-%m-%d %H:%M} 执行", "task": task}
+
+    _single_tasks[task_id] = task
+    asyncio.create_task(_run_single_notify_task(task))
+    return {"message": "任务已提交，正在执行", "task": task}
+
+
+@router.get("/task-hall/single")
+async def list_task_hall_single():
+    """任务大厅-单ASIN私发任务列表（内存登记）"""
+    tasks = sorted(_single_tasks.values(), key=lambda t: t["created_at"], reverse=True)
+    return {"tasks": tasks}
+
+
+@router.delete("/task-hall/single/{task_id}")
+async def cancel_task_hall_single(task_id: str):
+    """取消（或删除）任务大厅-单ASIN私发任务"""
+    task = _single_tasks.pop(task_id, None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    from app.tasks.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    if scheduler is not None:
+        try:
+            scheduler.remove_job(f"task_hall_single_{task_id}")
+        except Exception:  # noqa: BLE001
+            pass
+    return {"message": "任务已取消"}

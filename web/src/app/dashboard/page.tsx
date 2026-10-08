@@ -166,7 +166,7 @@ export default function DashboardPage() {
             <p className="text-2xl font-bold" style={{ color: "var(--accent-blue)" }}>USD/CNY = {fxRate.toFixed(4)}</p>
           </div>
           <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
-            更新时间：{fxUpdatedAt || "-"}（每日 02:00 自动同步 Google Finance，成本表同步使用）
+            更新时间：{fxUpdatedAt || "-"}（每日 08:22 自动同步 Google Finance，成本表同步使用）
           </p>
         </div>
       )}

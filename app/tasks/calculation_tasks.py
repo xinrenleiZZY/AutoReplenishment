@@ -115,6 +115,29 @@ async def _load_frequency_config(session: AsyncSession) -> tuple[dict, int]:
     return freq_map, int(default_freq)
 
 
+def _normalize_lifecycles(raw) -> set[str]:
+    """解析生命周期过滤（逗号分隔字符串 / list / set，支持中英文逗号）；空=不过滤，返回空集合"""
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple, set)):
+        items: list[str] = []
+        for x in raw:
+            items.extend(str(x).replace("，", ",").split(","))
+    else:
+        items = str(raw).replace("，", ",").split(",")
+    return {x.strip() for x in items if x.strip()}
+
+
+async def _load_report_lifecycles(session: AsyncSession) -> set[str]:
+    """读取日报分析生命周期自定义（逗号分隔，可多选）；空=全部生命周期不过滤，返回空集合"""
+    from app.services.config_service import get_param
+
+    raw = await get_param(session, "report_lifecycles")
+    if raw is None:
+        raw = settings.REPORT_LIFECYCLES
+    return _normalize_lifecycles(raw)
+
+
 async def _load_schedule_overrides(session: AsyncSession) -> dict[str, tuple[date, date]]:
     """读取排程重置(时间调节器)覆盖：{asin: (override_last_date, target_date)}"""
     rows = await session.execute(
@@ -989,6 +1012,7 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
             "first_month_forecast_qty": inventory.get("first_month_forecast_qty"),
             "arrival_days": inventory.get("arrival_days"),
             "sellable_gap_qty": inventory.get("sellable_gap_qty"),
+            "gap_exempt": inventory.get("gap_exempt"),
             "在途预计上架日": inventory.get("inbound_arrival_date"),
             "在途预计上架日口径": inventory.get("inbound_arrival_formula"),
             "strategy_note": suggest_note,
@@ -1707,6 +1731,22 @@ async def run_due_calculation(force: bool = False, progress: dict | None = None)
                     continue
                 due_products.append(product)
 
+            # 日报分析生命周期自定义过滤：仅按频率模式生效，空配置=全部生命周期不过滤
+            if not force:
+                allowed_lifecycles = await _load_report_lifecycles(session)
+                if allowed_lifecycles:
+                    before = len(due_products)
+                    due_products = [
+                        p for p in due_products
+                        if (p.life_cycle or "未知").strip() in allowed_lifecycles
+                    ]
+                    filtered = before - len(due_products)
+                    stats["skipped"] += filtered
+                    logger.info(
+                        "日报生命周期过滤：允许 %s，剔除 %d 个到期产品",
+                        sorted(allowed_lifecycles), filtered,
+                    )
+
             if progress is not None:
                 progress["total"] = len(due_products)
                 progress["done"] = 0
@@ -1794,9 +1834,11 @@ async def run_batch_calculation(progress: dict | None = None):
     return await run_due_calculation(force=True, progress=progress)
 
 
-async def run_level_calculation(level: str, progress: dict | None = None) -> dict:
+async def run_level_calculation(level: str, progress: dict | None = None,
+                                lifecycles: str | list[str] | set[str] | None = None) -> dict:
     """立即计算指定等级（S/A/B/C/D）的全部启用产品，忽略频率
     支持多等级："SAB" 或 "S,A,B"（API / 脚本均可传）。
+    lifecycles: 可选生命周期过滤（如 "启动期,增长期,热卖期"），None/空=不限制
     progress: 可选进度字典 {"total","done","percent","current_asin"}
     """
     levels = _normalize_levels(level)
@@ -1813,6 +1855,11 @@ async def run_level_calculation(level: str, progress: dict | None = None) -> dic
                 select(Product).where(Product.status == True, Product.product_level.in_(levels))  # noqa: E712
             )
             products = result.scalars().all()
+            lc_filter = _normalize_lifecycles(lifecycles)
+            if lc_filter:
+                before = len(products)
+                products = [p for p in products if (p.life_cycle or "未知").strip() in lc_filter]
+                logger.info("按等级计算生命周期过滤：允许 %s，剔除 %d 个产品", sorted(lc_filter), before - len(products))
             if progress is not None:
                 progress["total"] = len(products)
                 progress["done"] = 0
@@ -1981,10 +2028,12 @@ async def _latest_calculation_rows(session: AsyncSession) -> list:
 
 
 async def get_daily_summary(session: AsyncSession, include_results: bool = True,
-                            levels: str | list[str] | None = None) -> dict:
+                            levels: str | list[str] | None = None,
+                            lifecycles: str | list[str] | set[str] | None = None) -> dict:
     """生成日报汇总数据（include_results=False 时不返回全量明细，用于看板轻量加载）
 
     levels: 可选产品等级过滤（如 "SAB" 或 ["S","A","B"]），None=不限制（默认全部等级）
+    lifecycles: 可选生命周期过滤（如 "启动期,增长期,热卖期"），None/空=不限制
     """
     today = date.today()
 
@@ -2012,18 +2061,23 @@ async def get_daily_summary(session: AsyncSession, include_results: bool = True,
         lv_str = ",".join(levels) if isinstance(levels, (list, tuple, set)) else levels
         level_filter = set(_normalize_levels(lv_str))
     all_asins = [r.asin for r in all_results]
+    life_filter = _normalize_lifecycles(lifecycles) or None
     active_map: dict[str, str] = {}
+    life_map: dict[str, str] = {}
     if all_asins:
         active_rows = await session.execute(
-            select(Product.asin, Product.product_level).where(
+            select(Product.asin, Product.product_level, Product.life_cycle).where(
                 Product.asin.in_(all_asins), Product.status == True  # noqa: E712
             )
         )
-        active_map = {row[0]: row[1] for row in active_rows.all()}
+        for row in active_rows.all():
+            active_map[row[0]] = row[1]
+            life_map[row[0]] = row[2]
     all_results = [
         r for r in all_results
         if r.asin in active_map
         and (level_filter is None or (active_map[r.asin] or "").upper() in level_filter)
+        and (life_filter is None or (life_map.get(r.asin) or "未知").strip() in life_filter)
     ]
 
     total_asins = len(all_results)
@@ -2339,17 +2393,23 @@ async def _is_new_product(product: Product, session: AsyncSession) -> bool:
 
     特例优先：品名命中特例关键词（参数 new_product_name_keywords，默认 26版/27版）
       → 新品（老品 ASIN 复用场景）；
+    其次 listing 标签命中老品特例标签（参数 product_type_old_tags，默认 19年前/18年前）
+      → 老品；
     其次上架日期（list_date ≤365天=新品，>365天=老品）；
     list_date 缺失时才用 product_stage 兜底。
     """
     from app.services.config_service import get_param
-    from app.services.product_stage import is_new_product_basic
+    from app.services.product_stage import OLD_TAGS_DEFAULT, is_new_product_basic
 
     try:
         keywords = await get_param(session, "new_product_name_keywords") or "26版,27版"
     except Exception:  # noqa: BLE001
         keywords = "26版,27版"
-    return is_new_product_basic(product, keywords)
+    try:
+        old_tags = await get_param(session, "product_type_old_tags")
+    except Exception:  # noqa: BLE001
+        old_tags = OLD_TAGS_DEFAULT
+    return is_new_product_basic(product, keywords, old_tags)
 
 
 async def _analyze_sales_history(
@@ -4608,6 +4668,8 @@ def _dump_sellable_gap_sim(asin: str, inventory: dict, m: dict) -> None:
             "到货天数": m.get("arrival_days"),
             "模拟到货前可售数量": m.get("simulated_sellable_qty"),
             "可售缺口数量": round(m.get("sellable_gap_qty") or 0, 1),
+            "缺口豁免(快递+空运均有利润)": bool(m.get("gap_exempt")),
+            "缺口是否已从建议量扣减": not bool(m.get("gap_exempt")),
             "基础建议(suggested_raw)": (
                 round(m["suggested_raw"], 1) if m.get("suggested_raw") is not None else None
             ),
@@ -4638,7 +4700,9 @@ def _base_suggested_gap(forecast: dict, inventory: dict, product: Product) -> di
       simulated_sellable_qty 模拟到货前可售数量（仅本地 json 备查，不落库）
       simulated_rows        模拟到货前各月明细
       sellable_gap_qty      可售库存缺口数量
+      gap_exempt            缺口豁免标记（快递+空运成本表均有利润 → True）
       suggested_raw         基础建议 = demand - available_stock - sellable_gap_qty
+                            （gap_exempt 为 True 时不扣减 sellable_gap_qty）
     """
     months = forecast.get("forecast_months") or []
     three_month_demand = sum(m.get("forecast_qty", 0) for m in months[:3])
@@ -4664,6 +4728,17 @@ def _base_suggested_gap(forecast: dict, inventory: dict, product: Product) -> di
     simulated_sellable_qty = sim["qty"]
     sellable_gap_qty = max(0.0, simulated_sellable_qty - float(available_stock or 0))
 
+    # ── 缺口扣减豁免：快递、空运成本表均有利润时，可用空运/快递在到货前补齐缺口，
+    #    故不再扣减缺口数量（建议量 = 预测销量 − 可用库存）。
+    #    仅当「快递(express)」「空运(air)」两渠道 Profit 均 >0 才豁免；否则维持原公式扣减。
+    gap_exempt = False
+    try:
+        _ct = new_product_policy.calc_cost_table(product)
+        _profitable = set(_ct.get("profitable_modes") or [])
+        gap_exempt = "express" in _profitable and "air" in _profitable
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[{getattr(product, 'asin', '')}] 缺口豁免成本表计算失败: {exc}")
+
     return {
         "demand": demand,
         "available_stock": available_stock,
@@ -4672,7 +4747,8 @@ def _base_suggested_gap(forecast: dict, inventory: dict, product: Product) -> di
         "simulated_sellable_qty": simulated_sellable_qty,
         "simulated_rows": sim["rows"],
         "sellable_gap_qty": sellable_gap_qty,
-        "suggested_raw": demand - available_stock - sellable_gap_qty,
+        "gap_exempt": gap_exempt,
+        "suggested_raw": demand - available_stock - (0.0 if gap_exempt else sellable_gap_qty),
     }
 
 
@@ -4689,12 +4765,14 @@ def _calc_suggested_qty(forecast: dict, inventory: dict, product: Product) -> in
           模拟到货前可售数量 = 窗口首日 → FBA在途到货日 区间内各月预估销量之和
           （各月预估 ÷ 该月天数 得日均，首月按窗口首日→月末的剩余天数）
           该值仅写本地 json 备查（p_id/sellable_gap/{asin}.json），暂不落库
+      - 缺口扣减豁免：快递、空运成本表均有利润时，不扣减可售库存缺口数量
     """
     m = _base_suggested_gap(forecast, inventory, product)
     # 计算字段落回 inventory，供记录/展示
     inventory["first_month_forecast_qty"] = m["first_month_forecast_qty"]
     inventory["arrival_days"] = m["arrival_days"]
     inventory["sellable_gap_qty"] = round(m["sellable_gap_qty"], 1)
+    inventory["gap_exempt"] = m["gap_exempt"]
     # 模拟到货前可售数量：仅写本地 json 备查，暂不落库
     _dump_sellable_gap_sim(getattr(product, "asin", ""), inventory, m)
 

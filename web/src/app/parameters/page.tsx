@@ -31,6 +31,18 @@ export default function ParametersPage() {
     "express_slow_fee", "express_peak_fee",
   ]);
 
+  const LIFECYCLE_OPTIONS = ["启动期", "增长期", "热卖期", "成熟期", "下降期", "未知"];
+
+  const toggleLifecycle = (key: string, value: string) => {
+    setEditing(prev => {
+      const current = (prev[key] ?? "").split(",").map(s => s.trim()).filter(Boolean);
+      const next = current.includes(value)
+        ? current.filter(v => v !== value)
+        : [...current, value];
+      return { ...prev, [key]: next.join(",") };
+    });
+  };
+
   const save = async (key: string) => {
     try {
       const res = await api.config.update(key, editing[key] ?? "");
@@ -98,6 +110,26 @@ export default function ParametersPage() {
                     <div style={{ maxWidth: 400, whiteSpace: "normal", overflowWrap: "anywhere" }}>{p.description}</div>
                   </td>
                   <td className="py-2 pr-3">
+                    {p.key === "report_lifecycles" ? (
+                      <div className="flex flex-wrap gap-x-3 gap-y-1" style={{ maxWidth: 400 }}>
+                        {LIFECYCLE_OPTIONS.map(lc => {
+                          const selected = (editing[p.key] ?? "").split(",").map(s => s.trim()).includes(lc);
+                          return (
+                            <label key={lc} className="inline-flex items-center gap-1 text-xs cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                onChange={() => toggleLifecycle(p.key, lc)}
+                              />
+                              {lc}
+                            </label>
+                          );
+                        })}
+                        <span className="text-[10px]" style={{ color: "var(--text-tertiary)" }}>
+                          （全不勾选=全部生命周期）
+                        </span>
+                      </div>
+                    ) : (
                     <span className="inline-flex items-center gap-1">
                       {feeKeys.has(p.key) && <span className="text-xs" style={{ color: "var(--text-tertiary)" }}>￥</span>}
                       <input
@@ -108,6 +140,7 @@ export default function ParametersPage() {
                         style={{ backgroundColor: "var(--bg-secondary)", borderColor: "var(--border-color)", color: "var(--text-primary)" }}
                       />
                     </span>
+                    )}
                   </td>
                   <td className="py-2 pr-3 font-mono text-xs">
                     <div style={{ maxWidth: 400, whiteSpace: "normal", overflowWrap: "anywhere" }}>

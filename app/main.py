@@ -10,7 +10,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import init_db, close_db, engine, async_session_factory
-from app.tasks.scheduler import setup_scheduler
+from app.tasks.scheduler import setup_scheduler, set_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"启动时节日日历年校验失败: {e}")
     scheduler = setup_scheduler()
+    set_scheduler(scheduler)
     scheduler.start()
     yield
     # 关闭时

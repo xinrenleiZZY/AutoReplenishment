@@ -45,6 +45,7 @@ const navStructure: NavEntry[] = [
       { href: "/time-axis", label: "销售时间轴", icon: "⏳" },
     ],
   },
+  { type: "link", href: "/task-hall", label: "任务大厅", icon: "🎯" },
   { type: "link", href: "/daily-report", label: "采购日报", icon: "📋" },
   { type: "link", href: "/analysis", label: "分析报告", icon: "📊" },
   { type: "link", href: "/sync-data", label: "今日同步数据", icon: "📥" },

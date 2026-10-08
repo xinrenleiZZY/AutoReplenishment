@@ -26,6 +26,10 @@ RAW_JSONL_PATH = os.path.join(P_ID_DIR, "msku_tags_raw.jsonl")
 TAGS_JSON_PATH = os.path.join(P_ID_DIR, "tags_full.json")
 BATCH_SIZE = 50
 
+# 仅保留这些状态的产品（1=在售, 0=停售），剔除 2=已删除
+KEEP_STATUS = {1, 0}
+KEEP_STATUS_TEXT = {"在售", "停售"}
+
 API_URL = "https://gw.lingxingerp.com/global-tag/global/tag/relation/getRelationTagList"
 
 from dotenv import load_dotenv
@@ -66,8 +70,14 @@ HEADERS = {
 
 def read_all_products() -> list[dict]:
     """
-    读取产品数据，返回 [{"msku": ..., "asin": ..., "store_id": ...}, ...]
-    store_id 在数据中为 sid，对应 API 中的 sid 字段
+    读取产品数据并按 ASIN 合并，返回
+      [{"asin": ..., "status_text": ..., "mskus": [{"msku": ..., "store_id": ...}, ...]}, ...]
+
+    规则:
+      1. 仅保留状态为 在售 / 停售 的产品，剔除 已删除 等其它状态；
+      2. 同一 ASIN 出现多次时去重合并（并集）：保留其全部在售/停售 MSKU，
+         按 (msku, store_id) 去重。
+    store_id 对应 API 中的 sid 字段
     """
     json_path = os.path.join(P_ID_DIR, "msku_id_full.json")
     if not os.path.exists(json_path):
@@ -76,26 +86,40 @@ def read_all_products() -> list[dict]:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    products = []
-    for item in data:
-        msku = item.get("msku", "").strip()
-        asin = item.get("asin", "").strip()
-        store_id = item.get("store_id")
-        if msku and asin and store_id:
-            products.append({"msku": msku, "asin": asin, "store_id": store_id})
-
-    logger.info(f"读取到 {len(products)} 个产品 (含 msku+asin+store_id)")
-    # 去重（msku 可能重复）
+    merged: dict[str, dict] = {}
     seen = set()
-    unique = []
-    for p in products:
-        key = (p["msku"], p["store_id"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-    if len(unique) < len(products):
-        logger.info(f"去重后剩余 {len(unique)} 个产品")
-    return unique
+    skipped = 0
+    for item in data:
+        msku = (item.get("msku") or "").strip()
+        asin = (item.get("asin") or "").strip()
+        store_id = item.get("store_id")
+        status = item.get("status")
+        status_text = (item.get("status_text") or "").strip()
+        if not (msku and asin and store_id):
+            continue
+        # 状态过滤：仅保留 在售 / 停售
+        if status_text:
+            if status_text not in KEEP_STATUS_TEXT:
+                skipped += 1
+                continue
+        elif status not in KEEP_STATUS:
+            skipped += 1
+            continue
+        # 去重合并（并集）：同一 ASIN 的全部在售/停售 MSKU，按 (msku, store_id) 去重
+        key = (msku, store_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = merged.get(asin)
+        if entry is None:
+            entry = {"asin": asin, "status_text": status_text, "mskus": []}
+            merged[asin] = entry
+        entry["mskus"].append({"msku": msku, "store_id": store_id})
+
+    products = list(merged.values())
+    msku_total = sum(len(p["mskus"]) for p in products)
+    logger.info(f"读取到 {len(products)} 个 ASIN（在售/停售，剔除 {skipped} 条），共 {msku_total} 个 MSKU")
+    return products
 
 
 def fetch_tags(bind_detail: list, req_seq: int) -> list:
@@ -126,10 +150,13 @@ def scrape_all_tags():
         return
 
     os.makedirs(P_ID_DIR, exist_ok=True)
-    total = len(products)
 
-    # 构建 bindDetail 列表
-    all_bind = [{"sid": p["store_id"], "relationId": p["msku"]} for p in products]
+    # 构建 bindDetail 列表（同一 ASIN 的全部在售/停售 MSKU）
+    all_bind = []
+    for p in products:
+        for m in p["mskus"]:
+            all_bind.append({"sid": m["store_id"], "relationId": m["msku"]})
+    total = len(all_bind)
 
     # 如果已有 JSONL，清空重新开始（API 无续传支持）
     f = open(RAW_JSONL_PATH, "w", encoding="utf-8")
@@ -137,8 +164,7 @@ def scrape_all_tags():
     try:
         for i in range(0, total, BATCH_SIZE):
             batch_bind = all_bind[i:i + BATCH_SIZE]
-            batch_products = products[i:i + BATCH_SIZE]
-            batch_mskus = [p["msku"] for p in batch_products]
+            batch_products = batch_bind
             seq += 1
             try:
                 resp_data = fetch_tags(batch_bind, seq)
@@ -173,13 +199,12 @@ def clean_tags():
         logger.error(f"无原始数据: {RAW_JSONL_PATH}")
         return
 
-    # 先建立 msku → asin 的映射
+    # 先建立 msku → asin 的映射（同一 ASIN 的多个 MSKU 均指向该 ASIN）
     products = read_all_products()
     msku_to_asin = {}
     for p in products:
-        key = p["msku"]
-        if key not in msku_to_asin:
-            msku_to_asin[key] = p["asin"]
+        for m in p["mskus"]:
+            msku_to_asin.setdefault(m["msku"], p["asin"])
 
     all_tags = {}
     batch_count = 0
@@ -205,14 +230,23 @@ def clean_tags():
 
             for item in resp_data:
                 msku = (item.get("relationId") or "").strip()
-                tags = item.get("tagInfos", [])
-                if msku and tags:
-                    asin = msku_to_asin.get(msku, "")
-                    if asin:
-                        all_tags[asin] = tags
-                        tag_count += 1
-                    else:
-                        logger.debug(f"msku '{msku}' 未匹配到 ASIN")
+                tags = item.get("tagInfos") or []
+                if not (msku and tags):
+                    continue
+                asin = msku_to_asin.get(msku, "")
+                if not asin:
+                    logger.debug(f"msku '{msku}' 未匹配到 ASIN")
+                    continue
+                # 同一 ASIN 的多个 MSKU 标签取并集去重（按 globalTagId，fallback tagName）
+                bucket = all_tags.setdefault(asin, [])
+                seen_keys = {(t.get("globalTagId") or t.get("tagName")) for t in bucket}
+                for t in tags:
+                    tk = t.get("globalTagId") or t.get("tagName")
+                    if not tk or tk in seen_keys:
+                        continue
+                    seen_keys.add(tk)
+                    bucket.append(t)
+                    tag_count += 1
 
     with open(TAGS_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(all_tags, f, ensure_ascii=False, indent=2)

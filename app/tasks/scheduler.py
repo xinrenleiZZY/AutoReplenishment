@@ -16,6 +16,20 @@ from app.tasks.calculation_tasks import run_due_calculation
 
 logger = logging.getLogger(__name__)
 
+# 全局调度器引用（供 API 动态注册一次性定时任务，如任务大厅的单ASIN定时私发）
+_scheduler: AsyncIOScheduler | None = None
+
+
+def set_scheduler(scheduler: AsyncIOScheduler) -> None:
+    """应用启动时登记全局调度器实例"""
+    global _scheduler
+    _scheduler = scheduler
+
+
+def get_scheduler() -> AsyncIOScheduler | None:
+    """获取全局调度器实例（未启动时返回 None）"""
+    return _scheduler
+
 
 def _record_result(log, session, status, total=None, success=None, error=None):
     """记录同步结果并提交"""
@@ -83,7 +97,11 @@ async def run_daily_flow():
 
 
 async def sync_profit_rates():
-    """每日回填利润率为空的产品（领星毛利报表）"""
+    """每日兜底回填利润率为空的产品（领星 MCP 毛利报表）
+
+    profit_rate 主来源为经营利润报表（sync_profit_report）；本任务仅补齐报表未覆盖（仍为空）的产品，
+    因此排在经营利润报表之后执行。
+    """
     log = SyncLog(sync_type="profit", status="running")
     session = async_session_factory()
     try:
@@ -275,7 +293,8 @@ async def sync_daily_sales():
 async def sync_profit_report():
     """每日同步领星经营利润报表毛利率（bd/profit/report/report/asin/list，按单日日报）
 
-    抓取最近 3 天（昨天为主 + 兜底近两天延迟结算），按 stat_date 幂等全量覆盖，写入 profit_report_stats。
+    抓取最近 3 天（昨天为主 + 兜底近两天延迟结算），按 stat_date 幂等全量覆盖，写入 profit_report_stats；
+    随后把报表毛利率回填到 products.profit_rate（profit_rate 的主要来源，覆盖写入）。
     """
     log = SyncLog(sync_type="profit_report", status="running")
     session = async_session_factory()
@@ -284,17 +303,19 @@ async def sync_profit_report():
             session.add(log)
             await session.commit()
 
-        from scripts.sync_profit_report import sync_range as sync_profit_range
+        from scripts.sync_profit_report import backfill_products_profit_rate, sync_range as sync_profit_range
 
         today = date.today()
         start = (today - timedelta(days=3)).isoformat()
         end = (today - timedelta(days=1)).isoformat()
         stats = await sync_profit_range(start, end, dry_run=False)
+        # 报表毛利率回填 products.profit_rate（主来源）
+        bf = await backfill_products_profit_rate()
         written = (stats or {}).get("written", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=written, success=written)
+            _record_result(log, session, "success", total=written, success=(bf or {}).get("updated", 0))
             await session.commit()
-        logger.info("经营利润报表同步完成: %s", stats)
+        logger.info("经营利润报表同步完成: %s | profit_rate 回填: %s", stats, bf)
     except Exception as e:  # noqa: BLE001
         async with session:
             _record_result(log, session, "failed", error=e)
@@ -386,20 +407,22 @@ def setup_scheduler() -> AsyncIOScheduler:
     """设置定时任务调度器"""
     scheduler = AsyncIOScheduler()
 
-    # 数据同步任务（每天固定时间执行，错开15分钟避免领星API并发限流）
+    # 数据同步任务（主数据全量同步窗口 07:00–08:20，80 分钟内错开以避开领星API并发限流）
     sync_hour, sync_minute = (int(x) for x in settings.SYNC_TIME.split(":"))
+    sync_base = sync_hour * 60 + sync_minute
     sync_jobs = [
         (sync_products, 0, "sync_products", "同步产品数据"),
-        (sync_sales_data, 15, "sync_sales", "同步销量数据"),
-        (sync_inventory, 30, "sync_inventory", "同步库存数据"),
-        (sync_purchase_orders, 40, "sync_purchase_orders", "同步待到货量"),
-        (sync_box_quantity, 45, "sync_box_quantity", "同步箱规数据"),
-        (sync_sales_statistics, 55, "sync_sales_statistics", "同步销售统计"),
+        (sync_sales_data, 16, "sync_sales", "同步销量数据"),
+        (sync_inventory, 32, "sync_inventory", "同步库存数据"),
+        (sync_purchase_orders, 48, "sync_purchase_orders", "同步待到货量"),
+        (sync_box_quantity, 64, "sync_box_quantity", "同步箱规数据"),
+        (sync_sales_statistics, 80, "sync_sales_statistics", "同步销售统计"),
     ]
     for job, offset, job_id, name in sync_jobs:
+        total = sync_base + offset
         scheduler.add_job(
             job,
-            trigger=CronTrigger(hour=sync_hour, minute=(sync_minute + offset) % 60),
+            trigger=CronTrigger(hour=(total // 60) % 24, minute=total % 60),
             id=job_id,
             name=name,
             replace_existing=True,
@@ -415,19 +438,19 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # 每日基础数据补充：领星月度 + 利润 + ACOS（02:00 起，避开 01:00–01:55 主同步窗口限流）
+    # 每日基础数据补充：领星月度 + 经营利润报表(→profit_rate 主来源) + ACOS + 利润兜底（08:22 起，主同步窗口 08:20 结束后、基础分析 08:45 之前）
     daily_foundation_jobs = [
-        (sync_monthly_lingxing, 5, "sync_monthly_lingxing", "领星月度回填(每日)"),
-        (sync_profit_rates, 15, "sync_profit_rates", "利润回填(每日)"),
-        (sync_acos, 25, "sync_acos", "ACOS回填(每日)"),
-        (sync_daily_sales, 35, "sync_daily_sales", "逐日销量(每日)"),
-        (sync_profit_report, 45, "sync_profit_report", "经营利润报表(每日)"),
-        (sync_purchase_sources, 55, "sync_purchase_sources", "采购计划+listNew+采购单看板(每日)"),
+        (sync_monthly_lingxing, 25, "sync_monthly_lingxing", "领星月度回填(每日)"),
+        (sync_profit_report, 28, "sync_profit_report", "经营利润报表→profit_rate(每日,主)"),
+        (sync_acos, 31, "sync_acos", "ACOS回填(每日)"),
+        (sync_daily_sales, 34, "sync_daily_sales", "逐日销量(每日)"),
+        (sync_profit_rates, 37, "sync_profit_rates", "利润兜底(每日)"),
+        (sync_purchase_sources, 40, "sync_purchase_sources", "采购计划+listNew+采购单看板(每日)"),
     ]
     for job, minute, job_id, name in daily_foundation_jobs:
         scheduler.add_job(
             job,
-            trigger=CronTrigger(hour=2, minute=minute),
+            trigger=CronTrigger(hour=8, minute=minute),
             id=job_id,
             name=name,
             replace_existing=True,
@@ -436,7 +459,7 @@ def setup_scheduler() -> AsyncIOScheduler:
     # 基础数据分析：每日基础数据源同步完成后触发一次（等级→节日→生命周期）
     scheduler.add_job(
         sync_base_analysis,
-        trigger=CronTrigger(hour=3, minute=0),
+        trigger=CronTrigger(hour=8, minute=45),
         id="sync_base_analysis",
         name="基础数据分析(每日)",
         replace_existing=True,
@@ -444,7 +467,7 @@ def setup_scheduler() -> AsyncIOScheduler:
 
     scheduler.add_job(
         sync_fx_rate,
-        trigger=CronTrigger(hour=2, minute=0),
+        trigger=CronTrigger(hour=8, minute=22),
         id="sync_fx_rate",
         name="实时汇率同步(每日)",
         replace_existing=True,

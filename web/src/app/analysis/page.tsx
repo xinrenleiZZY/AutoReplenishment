@@ -68,8 +68,11 @@ export default function AnalysisPage() {
 
   const analyzeOne = async (asin: string) => {
     setAnalyzing(prev => ({ ...prev, [asin]: true }));
+    setError(null);
     try {
-      await api.calculation.trigger(asin);
+      const res = await api.calculation.trigger(asin);
+      const job = await pollJob(res.job_id);
+      if (job.status === "failed") throw new Error(job.error || "分析失败");
       load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "计算失败");

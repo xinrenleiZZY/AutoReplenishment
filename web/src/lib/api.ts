@@ -490,7 +490,44 @@ export interface CalcJob {
     done: number;
     percent: number;
     current_asin: string | null;
+    stage?: string | null;
   };
+}
+
+export interface TaskHallMultiResult {
+  levels: string;
+  lifecycles: string | null;
+  calc: {
+    total: number | null;
+    success: number | null;
+    failed: number | null;
+    immediate: number | null;
+    observe: number | null;
+    pause: number | null;
+  };
+  report?: {
+    sent: boolean;
+    reason?: string;
+    image_sent?: boolean;
+    total_asins?: number;
+    immediate_count?: number;
+    observe_count?: number;
+    pause_count?: number;
+  };
+}
+
+export interface TaskHallSingleTask {
+  id: string;
+  asin: string;
+  operator: string | null;
+  product_operator: string | null;
+  run_at: string | null;
+  status: "pending" | "running" | "done" | "failed";
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  stats: Record<string, unknown> | null;
+  error: string | null;
 }
 
 export interface LifecycleStats {
@@ -885,7 +922,7 @@ export const api = {
         `/api/v1/calculation/results/${asin}/latest/steps`
       ),
     trigger: (asin: string) =>
-      fetchJSON<{ message: string; data: CalculationResult; notify: { sent: boolean; reason?: string; operator?: string } }>(
+      fetchJSON<{ message: string; job_id: string; status: string }>(
         `/api/v1/calculation/trigger/${asin}`,
         { method: "POST" }
       ),
@@ -934,6 +971,20 @@ export const api = {
         "/api/v1/calculation/daily-report/push",
         { method: "POST" }
       ),
+    taskHallMulti: (params: { levels: string; lifecycles?: string; with_report?: boolean; with_image?: boolean }) =>
+      fetchJSON<{ message: string; job_id: string; status: string }>(
+        `/api/v1/calculation/task-hall/multi${toQuery(params)}`,
+        { method: "POST" }
+      ),
+    taskHallSingleList: () =>
+      fetchJSON<{ tasks: TaskHallSingleTask[] }>("/api/v1/calculation/task-hall/single"),
+    taskHallSingleCreate: (params: { asin: string; operator?: string; run_at?: string }) =>
+      fetchJSON<{ message: string; task: TaskHallSingleTask }>(
+        `/api/v1/calculation/task-hall/single${toQuery(params)}`,
+        { method: "POST" }
+      ),
+    taskHallSingleCancel: (id: string) =>
+      fetchJSON<{ message: string }>(`/api/v1/calculation/task-hall/single/${id}`, { method: "DELETE" }),
   },
   festivalCalendar: {
     list: () => fetchJSON<FestivalCalendar[]>("/api/v1/festival-calendar?limit=200"),

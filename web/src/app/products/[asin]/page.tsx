@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { api, type CostTable, type Operator, type ProductCostOverride } from "@/lib/api";
+import { api, pollJob, type CostTable, type Operator, type ProductCostOverride } from "@/lib/api";
 
 export default function ProductDetailPage() {
   const params = useParams();
@@ -41,7 +41,9 @@ export default function ProductDetailPage() {
     setAnalyzing(true);
     setCalcMsg(null);
     try {
-      await api.calculation.trigger(asin);
+      const res = await api.calculation.trigger(asin);
+      const job = await pollJob(res.job_id);
+      if (job.status === "failed") throw new Error(job.error || "分析失败");
       setCalcMsg("分析完成，结果已更新");
       setRefresh(r => r + 1);
     } catch (e) {

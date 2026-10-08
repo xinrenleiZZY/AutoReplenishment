@@ -58,7 +58,7 @@ class Settings(BaseSettings):
 
     # 定时任务
     SYNC_INTERVAL_HOURS: int = 24
-    SYNC_TIME: str = "01:00"  # 数据同步每日执行时间（HH:MM）
+    SYNC_TIME: str = "07:00"  # 数据同步每日执行时间（HH:MM，主数据全量同步窗口起点 07:00–08:20）
     CALC_INTERVAL_HOURS: int = 24
     DAILY_REPORT_TIME: str = "09:00"  # 按频率计算+日报时间（HH:MM）
     # 日报大屏图片生成：browser=用 headless Chromium 截取网页数据大屏（与网页完全一致，默认）；
@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     CALC_FREQUENCIES: str = "S:1,A:3,B:5,C:7,D:14"
     # 无等级/未配置等级时的默认频率（天）
     CALC_FREQUENCY_DEFAULT: int = 14
+    # 日报分析生命周期自定义（逗号分隔，可多选：启动期/增长期/热卖期/成熟期/下降期/未知；空=全部生命周期不过滤）
+    REPORT_LIFECYCLES: str = ""
     # 产品等级口径：mixed=老品按去年总销量+新品按近30天年化（方案D，默认）；annualize=全部近30天年化（方案C）
     PRODUCT_LEVEL_MODE: str = "mixed"
 

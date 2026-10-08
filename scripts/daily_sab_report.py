@@ -4,12 +4,15 @@
     python -m scripts.daily_sab_report SAB
     python -m scripts.daily_sab_report --level S,A,B
     python -m scripts.daily_sab_report SAB --no-ai --no-image --all-levels
+    python -m scripts.daily_sab_report S,A --lifecycles 启动期,增长期,热卖期
 
 流程:
     1) 仅对传入等级（默认 SAB）的启用产品立即计算（忽略频率，多等级用 run_level_calculation）；
     2) 基于当日计算结果生成日报摘要（默认只统计本次计算的等级，--all-levels 放宽为全等级）；
     3) AI 日报总结（DEEPSEEK_AI_EVAL_ENABLED=true 时自动生成，--no-ai 跳过）；
     4) 推送飞书日报卡片，应用机器人模式下附带日报大屏图片（--no-image 跳过）。
+
+可选 --lifecycles 按生命周期过滤（如 启动期,增长期,热卖期），计算与日报摘要均沿用该过滤。
 """
 
 import argparse
@@ -39,6 +42,10 @@ def parse_args() -> argparse.Namespace:
         "--all-levels", action="store_true",
         help="日报统计当日全部等级结果（默认只统计本次计算的等级）",
     )
+    parser.add_argument(
+        "--lifecycles", default=None,
+        help="按生命周期过滤，逗号分隔，如 启动期,增长期,热卖期（默认全部）",
+    )
     parser.add_argument("--no-ai", action="store_true", help="跳过 AI 日报总结")
     parser.add_argument("--no-image", action="store_true", help="跳过日报大屏图片")
     return parser.parse_args()
@@ -55,10 +62,11 @@ async def main() -> int:
         print(f"无效产品等级: {args.level}，支持 S/A/B/C/D（如 SAB 或 S,A,B）")
         return 1
     level_arg = ",".join(levels)
-    print(f"STEP1 计算等级 {levels}（共 {len(levels)} 个）")
+    print(f"STEP1 计算等级 {levels}（共 {len(levels)} 个）"
+          + (f"，生命周期过滤 {args.lifecycles}" if args.lifecycles else ""))
 
     # 1) 按等级立即计算（忽略频率）
-    stats = await run_level_calculation(level_arg)
+    stats = await run_level_calculation(level_arg, lifecycles=args.lifecycles)
     print("CALC_STATS:", json.dumps({
         "total": stats.get("total"),
         "success": stats.get("success"),
@@ -77,6 +85,7 @@ async def main() -> int:
         summary = await get_daily_summary(
             session,
             levels=None if args.all_levels else level_arg,
+            lifecycles=args.lifecycles,
         )
     print("SUMMARY:", json.dumps({
         "calc_date": summary.get("calc_date"),

@@ -116,7 +116,7 @@ export default function SyncLogsPage() {
         </button>
       </div>
       <p className="text-sm mb-4" style={{ color: "var(--text-tertiary)" }}>
-        每天 01:00-01:45 自动同步产品/销量/库存/箱规；也可点击下方按钮立即同步。
+        每天 07:00-08:20 自动同步主数据（产品/销量/库存/待到货量/箱规/销售统计）；08:22-08:40 补充基础数据（月度/利润/ACOS/逐日销量/利润报表/采购来源）；08:45 基础分析。也可点击下方按钮立即同步。
       </p>
 
       <div className="card mb-6">
@@ -143,7 +143,7 @@ export default function SyncLogsPage() {
       {loading && <p>加载中...</p>}
       {!loading && logs.length === 0 && (
         <div className="card text-center py-12" style={{ color: "var(--text-tertiary)" }}>
-          暂无同步记录：API 服务需在 01:00 前后保持运行才会产生定时同步日志，或点击上方按钮立即同步。
+          暂无同步记录：API 服务需在 07:00 前后保持运行才会产生定时同步日志，或点击上方按钮立即同步。
         </div>
       )}
       {logs.length > 0 && (

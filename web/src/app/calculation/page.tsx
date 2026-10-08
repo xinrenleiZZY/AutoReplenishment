@@ -121,7 +121,7 @@ export default function CalculationPage() {
   const [pageSize, setPageSize] = useState(initial.pageSize);
   const [batchStats, setBatchStats] = useState<BatchStats | null>(null);
   const [dueStats, setDueStats] = useState<DueStats | null>(null);
-  const [progress, setProgress] = useState<{ total: number; done: number; percent: number; current_asin: string | null } | null>(null);
+  const [progress, setProgress] = useState<{ total: number; done: number; percent: number; current_asin: string | null; stage?: string | null } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [visibility, setVisibility] = useState<Record<string, boolean>>(loadVisibility);
@@ -280,21 +280,39 @@ export default function CalculationPage() {
     setAnalyzing(prev => ({ ...prev, [asin]: true }));
     setError(null);
     setNotice(null);
+    setProgress({ total: 0, done: 0, percent: 0, current_asin: asin, stage: "准备重拉三项数据" });
     try {
       const res = await api.calculation.trigger(asin);
-      const notify = res.notify;
-      if (notify?.sent) {
-        setNotice(`分析完成，已私发结果给负责人「${notify.operator}」`);
-      } else if (notify?.reason) {
-        setNotice(`分析完成，未私发：${notify.reason}`);
+      let job = await api.calculation.getJob(res.job_id);
+      while (job.status === "running") {
+        if (job.progress) setProgress(job.progress);
+        await new Promise(r => setTimeout(r, 2000));
+        job = await api.calculation.getJob(res.job_id);
+      }
+      if (job.status === "failed") throw new Error(job.error || "分析失败");
+      const stats = job.stats as unknown as {
+        skipped?: boolean;
+        reason?: string;
+        error?: string;
+        notify?: { sent: boolean; reason?: string; operator?: string };
+      } | null;
+      if (stats?.error) {
+        setError(`分析失败：${stats.error}`);
+      } else if (stats?.skipped) {
+        setNotice(`已跳过：${stats.reason || "不满足计算条件"}`);
+      } else if (stats?.notify?.sent) {
+        setNotice(`分析完成，已私发结果给负责人「${stats.notify.operator}」`);
+      } else if (stats?.notify?.reason) {
+        setNotice(`分析完成，未私发：${stats.notify.reason}`);
       } else {
         setNotice("分析完成");
       }
       load({ keepScroll: true });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "计算失败");
+      setError(e instanceof Error ? e.message : "分析失败");
     } finally {
       setAnalyzing(prev => ({ ...prev, [asin]: false }));
+      setProgress(null);
     }
   };
 
@@ -487,6 +505,28 @@ export default function CalculationPage() {
         </div>
       </div>
 
+      {/* 自动分析ASIN发送：功能区块占位（暂不启动，触发条件后续补充） */}
+      <div className="card mb-4" style={{ borderLeft: "4px solid var(--text-tertiary)" }}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-sm font-semibold mb-1">
+              自动分析ASIN并发送
+              <span className="ml-2 px-1.5 py-0.5 rounded text-[10px]" style={{ backgroundColor: "var(--bg-tertiary)", color: "var(--text-tertiary)" }}>
+                未启用 · 条件待补充
+              </span>
+            </h3>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
+              启用后将自动执行：重新拉取三项数据（同步销量数据 / 同步库存数据 / 同步待到货量）→ 分析 → 私发负责人。
+              触发条件（ASIN 范围、频率等）后续补充。
+            </p>
+          </div>
+          <label className="inline-flex items-center gap-2 text-sm whitespace-nowrap cursor-not-allowed mt-1" style={{ color: "var(--text-tertiary)" }}>
+            <input type="checkbox" disabled readOnly checked={false} />
+            自动分析
+          </label>
+        </div>
+      </div>
+
       {showColumns && (
         <div className="card mb-4">
           <h3 className="text-sm font-semibold mb-3">可见字段（默认：ASIN / 品名 / 评分 / 级别 / 建议数量 / 库存天数 / 触发）</h3>
@@ -525,9 +565,9 @@ export default function CalculationPage() {
           <div style={{ height: 8, borderRadius: 4, backgroundColor: "var(--bg-tertiary)", overflow: "hidden" }}>
             <div style={{ height: "100%", width: `${progress.percent}%`, backgroundColor: "var(--accent-green)", transition: "width .5s" }} />
           </div>
-          {progress.current_asin && (
+          {(progress.stage || progress.current_asin) && (
             <p className="text-[10px] font-mono mt-1 truncate" style={{ color: "var(--text-tertiary)" }}>
-              正在计算: {progress.current_asin}
+              {progress.stage ? `当前步骤: ${progress.stage}` : `正在计算: ${progress.current_asin}`}
             </p>
           )}
         </div>

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 PARAM_DEFS: dict[str, tuple] = {
     "calc_frequencies": (settings.CALC_FREQUENCIES, "按等级计算频率（天），格式 S:1,A:3,B:5,C:7,D:14", "str"),
     "calc_frequency_default": (settings.CALC_FREQUENCY_DEFAULT, "无等级/未配置等级时的默认频率（天）", "int"),
+    "report_lifecycles": (settings.REPORT_LIFECYCLES, "日报分析生命周期自定义（逗号分隔，可多选：启动期/增长期/热卖期/成熟期/下降期/未知；留空=全部生命周期不过滤）", "str"),
     "forecast_months": (settings.FORECAST_MONTHS, "未来预测月数", "int"),
     "safe_stock_days": (settings.SAFE_STOCK_DAYS, "安全库存天数", "int"),
     "sea_slow_days": (settings.SEA_SLOW_DAYS, "海运淡季时效（天）", "int"),
@@ -63,6 +64,7 @@ PARAM_DEFS: dict[str, tuple] = {
     "product_type_long_tags": ("长期,西部牛仔", "长期产品特例标签（逗号分隔）；listing 标签命中即为长期产品，如 长期、西部牛仔", "str"),
     "product_type_festival_tags": ("", "节日产品特例标签（逗号分隔）；listing 标签命中即为节日产品（节日取标签映射，无映射用标签本身）", "str"),
     "new_product_name_keywords": ("26版,27版", "新品判定品名特例关键词（逗号分隔）；品名命中即为新品（老品ASIN复用场景）", "str"),
+    "product_type_old_tags": ("19年前,18年前", "老品判定特例标签（逗号分隔）；listing 标签命中即为老品", "str"),
     "new_product_base_days": (3, "新品等级评定基准销量统计天数（近N天日均，默认3）", "int"),
     "lifecycle_coeff": ('{"启动期":[1.03,1.0],"增长期":[1.15,1.15],"热卖期":[1.3,1.3],"成熟期":[1.0,1.2],"下降期":[0.7,1.0]}',
                         "新品等级评定各生命周期阶段系数（JSON，[预测销量系数,安全系数]）；启动期按 系数^(天数/10) 逐日累加", "str"),

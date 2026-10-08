@@ -4,6 +4,7 @@
 数据源：领星 经营利润报表 API bd/profit/report/report/asin/list（经「领星 API 服务站」转发，登录态由服务端注入）
 功能：按单日（startDate=endDate）抓取全部 ASIN 的经营利润报表，写入 profit_report_stats 表。
   - 需求口径：data.records.asins 对应系统 ASIN，data.records.grossRate 即毛利率（0~1，如 0.3806=38.06%）。
+  - profit_rate 主来源：backfill_products_profit_rate 把报表毛利率回填到 products.profit_rate（每日执行）。
   - 分页：接口用 offset/length（非 page/pageSize），服务站 auto_pagination 一次拉全量。
   - 幂等：按 stat_date 先删旧数据再全量写入（每天完整数据入库，每天更新）。
   - 整条原始响应 raw_data 兜底（保证不丢字段）。
@@ -13,6 +14,7 @@
     python scripts/sync_profit_report.py --date 2026-09-01             # 指定单日
     python scripts/sync_profit_report.py --start 2026-09-01 --end 2026-09-03   # 区间逐日回填
     python scripts/sync_profit_report.py --dry-run --date 2026-09-01   # 只抓取不写库
+    python scripts/sync_profit_report.py --backfill-products           # 抓取后回填 products.profit_rate（主来源）
 """
 
 import argparse
@@ -27,9 +29,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 load_dotenv()
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 
 from app.database import async_session_factory
+from app.models.product import Product
 from app.models.profit_report_stat import ProfitReportStat
 from app.services.lx_station import station_proxy
 from app.services.raw_store import collect_raw, flush_raw
@@ -190,6 +193,50 @@ async def sync_range(start: str, end: str, dry_run: bool = False, page_size: int
     return {"start": start, "end": end, "written": total_rows, "errors": errors}
 
 
+async def backfill_products_profit_rate(dry_run: bool = False) -> dict:
+    """把经营利润报表毛利率回填到 products.profit_rate（profit_rate 的主要来源）
+
+    每个 ASIN 取 profit_report_stats 中最新 stat_date 的 gross_rate 覆盖写入；
+    报表中缺失的 ASIN 保持原值（由 MCP 毛利报表兜底），因此本函数可作为主来源每日执行。
+    """
+    stats = {"scanned": 0, "updated": 0}
+    # 每个 ASIN 取最新统计日的毛利率（有值的行参与编号）
+    rn = func.row_number().over(
+        partition_by=ProfitReportStat.asin,
+        order_by=ProfitReportStat.stat_date.desc(),
+    ).label("rn")
+    sub = (
+        select(ProfitReportStat.asin, ProfitReportStat.gross_rate, rn)
+        .where(ProfitReportStat.gross_rate.isnot(None))
+        .subquery()
+    )
+    session = async_session_factory()
+    try:
+        async with session:
+            rows = (await session.execute(
+                select(sub.c.asin, sub.c.gross_rate).where(sub.c.rn == 1)
+            )).all()
+            mapping = {a: g for a, g in rows if a and g is not None}
+            stats["scanned"] = len(mapping)
+            if dry_run or not mapping:
+                print(f"[{'dry-run' if dry_run else 'backfill'}] 报表毛利率待回填 {len(mapping)} 个 ASIN")
+                return stats
+            products = (await session.execute(
+                select(Product).where(Product.status == True)  # noqa: E712
+            )).scalars().all()
+            for p in products:
+                g = mapping.get(p.asin)
+                if g is None:
+                    continue
+                p.profit_rate = g
+                stats["updated"] += 1
+            await session.commit()
+            print(f"已回填 products.profit_rate {stats['updated']} 条（经营利润报表）")
+    finally:
+        await session.close()
+    return stats
+
+
 def main_cli():
     parser = argparse.ArgumentParser(description="领星经营利润报表毛利率抓取")
     parser.add_argument("--date", type=str, default="", help="统计单日 YYYY-MM-DD（默认昨天）")
@@ -197,18 +244,26 @@ def main_cli():
     parser.add_argument("--end", type=str, default="", help="回填结束日期 YYYY-MM-DD（含）")
     parser.add_argument("--page-size", type=int, default=PAGE_SIZE, help="每页条数（默认100）")
     parser.add_argument("--dry-run", action="store_true", help="只抓取不写库")
+    parser.add_argument("--backfill-products", action="store_true",
+                        help="抓取完成后把报表毛利率回填到 products.profit_rate（主来源）")
     args = parser.parse_args()
 
     import asyncio
 
-    if args.start and args.end:
-        print(f"区间回填: {args.start} ~ {args.end}, page_size={args.page_size}")
-        stats = asyncio.run(sync_range(args.start, args.end, args.dry_run, args.page_size))
-    else:
-        d = args.date or (date.today() - timedelta(days=1)).isoformat()
-        print(f"抓取经营利润报表: {d}, page_size={args.page_size}, dry_run={args.dry_run}")
-        stats = asyncio.run(sync_profit_report(d, args.dry_run, args.page_size))
-    print(f"\n结果: {stats}")
+    async def _run():
+        if args.start and args.end:
+            print(f"区间回填: {args.start} ~ {args.end}, page_size={args.page_size}")
+            result = await sync_range(args.start, args.end, args.dry_run, args.page_size)
+        else:
+            d = args.date or (date.today() - timedelta(days=1)).isoformat()
+            print(f"抓取经营利润报表: {d}, page_size={args.page_size}, dry_run={args.dry_run}")
+            result = await sync_profit_report(d, args.dry_run, args.page_size)
+        if args.backfill_products:
+            bf = await backfill_products_profit_rate(args.dry_run)
+            print(f"products.profit_rate 回填: {bf}")
+        print(f"\n结果: {result}")
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
