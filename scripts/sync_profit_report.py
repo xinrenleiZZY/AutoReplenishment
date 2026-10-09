@@ -18,6 +18,7 @@
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -136,7 +137,7 @@ async def sync_profit_report(stat_date: str, dry_run: bool = False, page_size: i
     records = []
 
     try:
-        lst = fetch_all_records(stat_date, page_size, mids, sids)
+        lst = await asyncio.to_thread(fetch_all_records, stat_date, page_size, mids, sids)
     except Exception as e:  # noqa: BLE001
         print(f"[ERROR] {stat_date} 抓取失败: {e}")
         stats["errors"].append(str(e))

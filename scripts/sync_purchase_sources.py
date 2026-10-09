@@ -31,6 +31,7 @@
 """
 
 import argparse
+import asyncio
 import calendar
 import json
 import os
@@ -185,7 +186,8 @@ def fetch_plan_new() -> list[dict]:
 
 async def sync_purchase_plan_items(stats, dry_run):
     """抓取采购计划 listNew 并落库 purchase_plan_items"""
-    rows = fetch_plan_new()
+    # 可靠性：网络抓取放线程，避免阻塞事件循环
+    rows = await asyncio.to_thread(fetch_plan_new)
     stats["plan_items_total"] = len(rows)
     print(f"采购计划(listNew): {len(rows)} 条明细")
 
@@ -259,7 +261,7 @@ async def sync_purchase_board(stats, dry_run,
                               all_time: bool = False):
     """抓取采购单看板并落库"""
     s_date, e_date = _board_window(start_date, end_date, all_time=all_time)
-    lst, total = fetch_board(start_date=s_date, end_date=e_date)
+    lst, total = await asyncio.to_thread(fetch_board, start_date=s_date, end_date=e_date)
     stats["board_window"] = f"{s_date}~{e_date}"
     stats["board_total"] = total
     stats["board_records"] = len(lst)

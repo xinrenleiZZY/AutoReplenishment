@@ -125,6 +125,40 @@ def new_run_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+async def _write_step_rows(session, parent_id: int, sync_type: str, stats: dict | None,
+                           source: str | None = None, run_id: str | None = None) -> int:
+    """把 stats["steps"] 落成步骤级子记录（Phase 1 / G-16）。
+
+    约定：脚本在 stats["steps"] 里给出 {步骤名: {"ok": bool, ...}}，
+    本函数为每一步写一行 sync_logs（level="step"，parent_id=父行 id），
+    这样"哪一步慢/哪一步错"可以直接按 run_id 查询。
+    """
+    steps = (stats or {}).get("steps") if isinstance(stats, dict) else None
+    if not isinstance(steps, dict) or not steps:
+        return 0
+    n = 0
+    for name, info in steps.items():
+        info = info if isinstance(info, dict) else {"detail": info}
+        ok = bool(info.get("ok"))
+        err = info.get("error")
+        row = SyncLog(
+            sync_type=sync_type,
+            status="success" if ok else "failed",
+            level="step",
+            step=str(name)[:40],
+            parent_id=parent_id,
+            run_id=run_id,          # 与父行同 run_id，便于按 run 聚合查询
+            source=source,
+            total_count=info.get("total") or info.get("written") or info.get("matched_asins"),
+            success_count=info.get("written") or info.get("matched_asins"),
+            error_message=(str(err)[:2000] if err else None),
+            stats_json=json.dumps(info, ensure_ascii=False, default=str)[:10000],
+        )
+        session.add(row)
+        n += 1
+    return n
+
+
 async def mark_stale_running_interrupted(max_hours: int = 6) -> int:
     """把超过 max_hours 仍处于 running 的记录标记为 interrupted（进程被杀/无终态）"""
     from sqlalchemy import select, update
@@ -454,6 +488,13 @@ async def sync_purchase_sources():
                       error_keys=("plan_items_error", "board_error", "wait_error", "errors"),
                       zero_keys=("plan_items_written", "board_written"))
             await session.commit()
+            # Phase 1 / G-16：步骤级子记录（计划明细 / 看板 / 待到货量）
+            try:
+                await _write_step_rows(session, log.id, "purchase_sources", stats,
+                                       source=(stats or {}).get("source"), run_id=log.run_id)
+                await session.commit()
+            except Exception as e:  # noqa: BLE001  子记录失败不影响主流程
+                logger.warning("写入步骤级记录失败: %s", e)
         logger.info("采购计划/采购单看板同步完成: %s", stats)
     except Exception as e:  # noqa: BLE001
         async with session:

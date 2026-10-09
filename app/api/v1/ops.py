@@ -95,3 +95,111 @@ async def sync_freshness(
         "abnormal_sync": bad,
         "healthy": not [i for i in items if i["ok"] is False] and not bad,
     }
+
+
+@router.get("/alerts", summary="需要人工处理的同步告警清单")
+async def sync_alerts(
+    stale_running_hours: int = Query(2, ge=1, le=48, description="running 超过该小时数视为异常"),
+    recent: int = Query(300, ge=20, le=2000),
+    session: AsyncSession = Depends(get_session),
+):
+    """把"需要人管"的问题汇成一个清单（可被前端/巡检脚本直接消费）。
+
+    覆盖：① 产物过期 ② 最近一次同步 partial/failed ③ 长期 running ④ 成功但 0 条
+    """
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    rows = (await session.execute(
+        select(SyncLog).order_by(SyncLog.id.desc()).limit(recent)
+    )).scalars().all()
+
+    latest_by_type: dict[str, SyncLog] = {}
+    for r in rows:
+        if r.sync_type not in latest_by_type:
+            latest_by_type[r.sync_type] = r
+
+    alerts: list[dict] = []
+    for t, r in latest_by_type.items():
+        if r.status in ("failed", "partial"):
+            alerts.append({
+                "level": "error" if r.status == "failed" else "warning",
+                "kind": "sync_status",
+                "target": t,
+                "detail": f"最近一次 {t} 终态={r.status}",
+                "error_message": (r.error_message or "")[:500] or None,
+                "at": r.started_at.isoformat() if r.started_at else None,
+            })
+        elif r.status == "success" and r.total_count == 0 and t not in (
+            "monthly_lingxing", "profit", "acos",  # 这三类"无待回填"时 0 条属正常
+        ):
+            alerts.append({
+                "level": "warning", "kind": "zero_rows", "target": t,
+                "detail": f"最近一次 {t} 成功但 0 条，疑似上游异常",
+                "at": r.started_at.isoformat() if r.started_at else None,
+            })
+
+    # 长期 running
+    cutoff = now - timedelta(hours=stale_running_hours)
+    stuck = (await session.execute(
+        select(SyncLog).where(SyncLog.status == "running", SyncLog.started_at < cutoff)
+    )).scalars().all()
+    for r in stuck:
+        alerts.append({
+            "level": "error", "kind": "stuck_running", "target": r.sync_type,
+            "detail": f"{r.sync_type} 自 {r.started_at} 起一直 running（>{stale_running_hours}h）",
+            "at": r.started_at.isoformat() if r.started_at else None,
+        })
+
+    # 产物新鲜度
+    fresh = await sync_freshness(recent=recent, session=session)
+    for t in fresh["stale_tables"]:
+        alerts.append({"level": "error", "kind": "stale_table", "target": t,
+                       "detail": f"{t} 数据已过期", "at": fresh["checked_at"]})
+
+    order = {"error": 0, "warning": 1}
+    alerts.sort(key=lambda a: order.get(a["level"], 9))
+    return {
+        "checked_at": now.isoformat(timespec="seconds"),
+        "count": len(alerts),
+        "errors": len([a for a in alerts if a["level"] == "error"]),
+        "alerts": alerts,
+    }
+
+
+@router.get("/sync-run/{run_id}", summary="按 run_id 查看一次同步的父/子记录")
+async def sync_run_detail(run_id: str, session: AsyncSession = Depends(get_session)):
+    """返回该 run_id 的任务级记录 + 步骤级子记录（Phase 1 / G-16）。"""
+    rows = (await session.execute(
+        select(SyncLog).where(SyncLog.run_id == run_id).order_by(SyncLog.id)
+    )).scalars().all()
+    if rows:
+        # 兼容早期子记录：只写了 parent_id、未写 run_id
+        parent_ids = [r.id for r in rows]
+        extra = (await session.execute(
+            select(SyncLog).where(SyncLog.parent_id.in_(parent_ids))
+        )).scalars().all()
+        seen = {r.id for r in rows}
+        rows = rows + [r for r in extra if r.id not in seen]
+    if not rows:
+        return {"run_id": run_id, "found": 0, "task": None, "steps": []}
+    task = next((r for r in rows if (r.level or "task") == "task"), rows[0])
+
+    def _dump(r: SyncLog) -> dict:
+        return {
+            "id": r.id, "sync_type": r.sync_type, "status": r.status, "level": r.level,
+            "step": r.step, "parent_id": r.parent_id, "source": r.source,
+            "total_count": r.total_count, "success_count": r.success_count,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "duration_ms": r.duration_ms,
+            "error_message": (r.error_message or "")[:800] or None,
+            "stats_json": (r.stats_json or "")[:4000] or None,
+        }
+
+    return {
+        "run_id": run_id,
+        "found": len(rows),
+        "task": _dump(task),
+        "steps": [_dump(r) for r in rows if r.id != task.id],
+    }

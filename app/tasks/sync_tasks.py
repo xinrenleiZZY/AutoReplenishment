@@ -307,6 +307,15 @@ async def sync_purchase_order_items(mode: str = "full"):
             _finalize(log, session, stats, source="orderListsV2",
                       error_keys=("errors",), zero_keys=("written",))
             await session.commit()
+            # Phase 1 / G-16：若脚本给出分步统计，落步骤级子记录
+            try:
+                from app.tasks.scheduler import _write_step_rows
+
+                await _write_step_rows(session, log.id, "purchase_order_items", stats,
+                                       source="orderListsV2", run_id=log.run_id)
+                await session.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("写入步骤级记录失败(purchase_order_items): %s", e)
         logger.info("采购单产品明细同步完成: %s", stats)
         return stats
     except Exception as e:  # noqa: BLE001

@@ -15,6 +15,7 @@
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -137,7 +138,9 @@ async def sync_sales_statistics(start: str, end: str, query_type: str, group_typ
     records = []
 
     try:
-        lst, total = fetch_all(start, end, query_type, group_type, filter_date_type, seq)
+        lst, total = await asyncio.to_thread(
+            fetch_all, start, end, query_type, group_type, filter_date_type, seq
+        )
     except Exception as e:  # noqa: BLE001
         print(f"[ERROR] 抓取失败: {e}")
         stats["errors"].append(str(e))

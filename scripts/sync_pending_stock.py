@@ -77,7 +77,8 @@ def _to_int(v) -> int:
 
 async def sync_pending_stock(dry_run: bool = False) -> dict:
     """库存明细首选通道：pending_num → products/inventory_snapshots 待到货量"""
-    items = fetch_all_items()
+    # 可靠性：网络抓取放线程，避免阻塞事件循环
+    items = await asyncio.to_thread(fetch_all_items)
     print(f"库存明细共 {len(items)} 条")
 
     # SKU / 品名 → ASIN 映射

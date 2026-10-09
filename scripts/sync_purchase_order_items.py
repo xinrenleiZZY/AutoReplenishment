@@ -23,6 +23,7 @@
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -355,7 +356,8 @@ async def main(mode: str = "full", dry_run: bool = False) -> dict:
         stats["window"] = f"{start_date}~{end_date}"
 
     try:
-        orders, req_id = fetch_all_orders(start_date, end_date)
+        # 可靠性：网络抓取放线程，避免阻塞事件循环
+        orders, req_id = await asyncio.to_thread(fetch_all_orders, start_date, end_date)
     except Exception as e:  # noqa: BLE001
         stats["errors"].append(str(e))
         print(f"[ERROR] 采购单产品信息抓取失败: {e}")

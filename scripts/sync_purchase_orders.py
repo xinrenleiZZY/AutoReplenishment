@@ -218,7 +218,10 @@ def fetch_all_orders() -> list:
 
 
 async def main(dry_run: bool = False) -> dict:
-    orders = fetch_all_orders()
+    import asyncio
+
+    # 可靠性：同步 HTTP 调用放到线程执行，避免阻塞 API 事件循环（原先会卡住 /health）
+    orders = await asyncio.to_thread(fetch_all_orders)
     pending = [o for o in orders if (o.get("status_text") or "") == PENDING_STATUS]
     print(f"采购订单: {len(orders)} 条，待到货: {len(pending)} 条")
 
