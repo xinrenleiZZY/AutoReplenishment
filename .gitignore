@@ -43,6 +43,27 @@ logs/
 *.db
 *.sqlite3
 
+# 数据库备份（Phase 0 / G-01：本地保留，不进版本控制）
+backups/
+
+# 构建产物与依赖（Phase 0 / G-02：不入版本控制）
+web/.next/
+node_modules/
+web/node_modules/
+web/tsconfig.tsbuildinfo
+
+# 抓取落盘的大文件与历史（Phase 0 / G-02）
+p_id/*.jsonl
+p_id/msku_id_full.json
+p_id/msku_id_clean_full.json
+p_id/tags_full.json
+p_id/box_qty_full.json
+p_id/package_specs_full.json
+p_id/_test_trigger_api.py
+p_id/sales_history/
+p_id/sif_lifecycle/
+p_id/sellable_gap/
+
 # Alembic
 alembic/versions/*.pyc
 
