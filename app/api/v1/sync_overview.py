@@ -33,6 +33,7 @@ SYNC_TYPE_LABELS = {
     "profit_report": "经营利润报表",
     "purchase_sources": "采购计划/采购单",
     "base_analysis": "基础数据分析",
+    "purchase_order_items": "采购单产品明细",
 }
 
 

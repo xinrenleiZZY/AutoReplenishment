@@ -1,6 +1,8 @@
 """APScheduler 调度器配置"""
 
 import logging
+import json
+import uuid
 from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -11,6 +13,7 @@ from app.database import async_session_factory
 from app.models.sync_log import SyncLog
 from app.tasks.sync_tasks import (
     sync_products, sync_sales_data, sync_inventory, sync_box_quantity, sync_purchase_orders,
+    sync_purchase_order_items,
 )
 from app.tasks.calculation_tasks import run_due_calculation
 
@@ -42,6 +45,104 @@ def _record_result(log, session, status, total=None, success=None, error=None):
         log.error_message = str(error)[:2000]
     log.completed_at = datetime.now()
     session.add(log)
+
+
+# ──────────────────────────────────────────────
+#  终态判定（Phase 0 / G-14 + Phase 1 / G-16）
+# ──────────────────────────────────────────────
+
+# 这些 key 出现非 0/非空即代表"本步有进展"，用于区分 partial 与 failed
+_PROGRESS_KEYS = ("written", "updated", "total", "rows", "matched_asins",
+                  "plan_items_written", "board_written", "asins", "classified")
+
+
+def _classify_sync_result(stats: dict | None, error_keys=(), zero_keys=()) -> tuple[str, str]:
+    """纯函数：根据脚本返回的 stats 判定 (status, error_message)。
+
+    规则（Phase 0 / G-14）：
+      · error_keys 中任一非空，或 stats["errors"] 非空 → 有错误
+      · 有错误 且 有进展 → partial；有错误 且 无进展 → failed
+      · 无错误 但 zero_keys 中任一为 0/空 → partial（"成功但 0 条"不再记为 success）
+      · 其余 → success
+    """
+    stats = stats or {}
+    errors: list[str] = []
+    for key in error_keys:
+        val = stats.get(key)
+        if not val:
+            continue
+        if isinstance(val, (list, tuple, set)):
+            errors.extend(f"{key}: {str(x)[:300]}" for x in val if x)
+        else:
+            errors.append(f"{key}: {str(val)[:300]}")
+    extra = stats.get("errors")
+    if isinstance(extra, (list, tuple, set)):
+        errors.extend(str(x)[:300] for x in extra if x)
+    elif isinstance(extra, str) and extra.strip():
+        errors.append(extra[:300])
+
+    zeros = [k for k in zero_keys if not stats.get(k)]
+    has_progress = any(bool(stats.get(k)) for k in _PROGRESS_KEYS)
+
+    if errors:
+        status = "partial" if has_progress else "failed"
+        msg = "；".join(dict.fromkeys(errors))
+        return status, msg[:2000]
+    if zeros:
+        return "partial", f"关键产物为 0（{', '.join(zeros)}）：疑似上游抓取失败或未落库，请核查"
+    return "success", ""
+
+
+def _finalize(log, session, stats, *, source=None, run_id=None, total=None, success=None,
+              error_keys=(), zero_keys=(), label=""):
+    """按 stats 判定终态并写库（含 stats_json / duration_ms）"""
+    status, message = _classify_sync_result(stats, error_keys=error_keys, zero_keys=zero_keys)
+    log.run_id = log.run_id or run_id or new_run_id()
+    log.status = status
+    log.stats_json = json.dumps(stats, ensure_ascii=False, default=str)[:60000] if stats else None
+    if source:
+        log.source = source
+    if run_id:
+        log.run_id = run_id
+    if total is None and isinstance(stats, dict):
+        total = stats.get("total")
+    if success is None and isinstance(stats, dict):
+        success = stats.get("written") or stats.get("updated")
+    log.total_count = total
+    log.success_count = success
+    log.error_message = message or None
+    log.completed_at = datetime.now()
+    if log.started_at:
+        log.duration_ms = int((log.completed_at - log.started_at).total_seconds() * 1000)
+    session.add(log)
+    if status != "success":
+        logger.warning("同步任务 %s 终态=%s %s", log.sync_type, status, message[:200])
+    return status, message
+
+
+def new_run_id() -> str:
+    """生成一次运行的关联 ID（Phase 1 / G-16）"""
+    return uuid.uuid4().hex[:16]
+
+
+async def mark_stale_running_interrupted(max_hours: int = 6) -> int:
+    """把超过 max_hours 仍处于 running 的记录标记为 interrupted（进程被杀/无终态）"""
+    from sqlalchemy import select, update
+
+    cutoff = datetime.now() - timedelta(hours=max_hours)
+    async with async_session_factory() as session:
+        res = await session.execute(
+            update(SyncLog)
+            .where(SyncLog.status == "running", SyncLog.started_at < cutoff)
+            .values(status="interrupted",
+                    completed_at=datetime.now(),
+                    error_message="进程中断：超过 %d 小时未写入终态，已由启动巡检标记" % max_hours)
+        )
+        await session.commit()
+        n = res.rowcount or 0
+    if n:
+        logger.warning("已标记 %d 条超时 running 记录为 interrupted", n)
+    return n
 
 
 async def run_daily_flow():
@@ -114,7 +215,8 @@ async def sync_profit_rates():
         stats = await backfill_profit(limit=100000, offset=0, days=30, all_=False)
         filled = (stats or {}).get("updated", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=filled, success=filled)
+            # 0 条属合法（无待回填），但 errors 非空必须暴露
+            _finalize(log, session, stats, total=filled, success=filled, error_keys=("errors",))
             await session.commit()
         logger.info("利润回填完成: %s", stats)
     except Exception as e:
@@ -140,7 +242,7 @@ async def sync_acos():
         stats = await backfill_acos(limit=100000, offset=0, all_=False)
         filled = (stats or {}).get("updated", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=filled, success=filled)
+            _finalize(log, session, stats, total=filled, success=filled, error_keys=("errors",))
             await session.commit()
         logger.info("ACOS 回填完成: %s", stats)
     except Exception as e:
@@ -166,7 +268,7 @@ async def sync_monthly_lingxing():
         stats = await run_backfill()
         added = (stats or {}).get("lingxing", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=added, success=added)
+            _finalize(log, session, stats, total=added, success=added, error_keys=("errors",))
             await session.commit()
         logger.info("领星月度回填完成: %s", stats)
     except Exception as e:
@@ -193,7 +295,7 @@ async def sync_base_analysis():
             stats = await refresh_foundation(s2)
         total = (stats or {}).get("total", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=total, success=total)
+            _finalize(log, session, stats, total=total, success=total, zero_keys=("total",))
             await session.commit()
         logger.info("基础数据分析完成: %s", stats)
     except Exception as e:
@@ -246,7 +348,9 @@ async def sync_sales_statistics():
                             query_type="volume", group_type="asin", dry_run=False)
         total = (stats or {}).get("total", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=total, success=total)
+            # 抓取异常时脚本把原因放进 stats["errors"]；total=0 视为异常（年初至今不应为 0）
+            _finalize(log, session, stats, total=total, success=total,
+                      error_keys=("errors",), zero_keys=("total",))
             await session.commit()
         logger.info("销售统计同步完成: %s", stats)
     except Exception as e:  # noqa: BLE001
@@ -278,7 +382,8 @@ async def sync_daily_sales():
             stats = await daily_update()
         written = (stats or {}).get("written", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=written, success=written)
+            _finalize(log, session, stats, total=written, success=written,
+                      error_keys=("errors",), zero_keys=("written",))
             await session.commit()
         logger.info("逐日销量同步完成: %s", stats)
     except Exception as e:  # noqa: BLE001
@@ -313,7 +418,8 @@ async def sync_profit_report():
         bf = await backfill_products_profit_rate()
         written = (stats or {}).get("written", 0) if isinstance(stats, dict) else 0
         async with session:
-            _record_result(log, session, "success", total=written, success=(bf or {}).get("updated", 0))
+            _finalize(log, session, stats, total=written, success=(bf or {}).get("updated", 0),
+                      error_keys=("errors",), zero_keys=("written",))
             await session.commit()
         logger.info("经营利润报表同步完成: %s | profit_rate 回填: %s", stats, bf)
     except Exception as e:  # noqa: BLE001
@@ -342,7 +448,11 @@ async def sync_purchase_sources():
             + (stats or {}).get("board_written", 0)
         )
         async with session:
-            _record_result(log, session, "success", total=total, success=total)
+            # Phase 0 / G-14：任一步骤失败 → partial/failed，并写入 error_message
+            _finalize(log, session, stats, total=total, success=total,
+                      source=(stats or {}).get("source"),
+                      error_keys=("plan_items_error", "board_error", "wait_error", "errors"),
+                      zero_keys=("plan_items_written", "board_written"))
             await session.commit()
         logger.info("采购计划/采购单看板同步完成: %s", stats)
     except Exception as e:  # noqa: BLE001
@@ -446,6 +556,7 @@ def setup_scheduler() -> AsyncIOScheduler:
         (sync_daily_sales, 34, "sync_daily_sales", "逐日销量(每日)"),
         (sync_profit_rates, 37, "sync_profit_rates", "利润兜底(每日)"),
         (sync_purchase_sources, 40, "sync_purchase_sources", "采购计划+listNew+采购单看板(每日)"),
+        (lambda: sync_purchase_order_items(mode="recent60"), 43, "sync_purchase_order_items", "采购单产品明细(每日近60天)"),
     ]
     for job, minute, job_id, name in daily_foundation_jobs:
         scheduler.add_job(

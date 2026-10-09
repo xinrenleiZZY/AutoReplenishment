@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # CORS（逗号分隔的来源白名单；默认 * 允许所有来源，不带凭证）
     CORS_ORIGINS: str = "*"
 
+    # ── API 写操作鉴权（Phase 0 / G-04，可开关） ──
+    # 为空 = 不鉴权（保持现状，零风险上电）；配置后，/api/v1/* 必须携带请求头 X-API-Token
+    # 前端由 web/src/middleware.ts 在服务端注入该头，不暴露给浏览器
+    API_AUTH_TOKEN: str = ""
+
     # 领星API
     LX_API_BASE_URL: str = ""
     LX_APP_KEY: str = ""

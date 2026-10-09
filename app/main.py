@@ -3,7 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -13,6 +13,25 @@ from app.database import init_db, close_db, engine, async_session_factory
 from app.tasks.scheduler import setup_scheduler, set_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    """统一日志格式（Phase 1 / G-11 基础）：时间 + 级别 + 模块 + 消息，输出到 stdout。
+
+    仅在 root 还没有 StreamHandler 时添加，避免与 uvicorn 自带配置重复打印。
+    """
+    level = getattr(logging, (settings.LOG_LEVEL or "INFO").upper(), logging.INFO)
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s [%(name)s] %(message)s"
+        ))
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
+_setup_logging()
 
 
 @asynccontextmanager
@@ -44,6 +63,14 @@ async def lifespan(app: FastAPI):
         logger.info(f"启动时节日日历年校验完成: {stats}")
     except Exception as e:
         logger.error(f"启动时节日日历年校验失败: {e}")
+    try:
+        # Phase 0 / G-14：把"进程被杀导致没有终态"的历史记录标记为 interrupted
+        from app.tasks.scheduler import mark_stale_running_interrupted
+
+        n = await mark_stale_running_interrupted(6)
+        logger.info(f"启动巡检：标记 {n} 条超时 running 同步记录为 interrupted")
+    except Exception as e:
+        logger.error(f"启动巡检（超时 running 记录）失败: {e}")
     scheduler = setup_scheduler()
     set_scheduler(scheduler)
     scheduler.start()
@@ -69,6 +96,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── 写操作鉴权（Phase 0 / G-04）：API_AUTH_TOKEN 为空时不生效 ──
+_AUTH_EXEMPT_PATHS = {"/api/v1/app-info"}
+
+
+@app.middleware("http")
+async def _api_token_guard(request: Request, call_next):
+    token = (settings.API_AUTH_TOKEN or "").strip()
+    path = request.url.path
+    if token and path.startswith("/api/v1") and path not in _AUTH_EXEMPT_PATHS:
+        supplied = (request.headers.get("x-api-token") or "").strip()
+        if supplied != token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "未授权：缺少或错误的 X-API-Token（Phase 0 G-04 写操作鉴权）"},
+            )
+    return await call_next(request)
 
 
 @app.get("/")
@@ -130,6 +174,8 @@ from app.api.v1 import (  # noqa: E402
     data_source,
     app_info,
     semantic_classifications,
+    ops,
+    purchase_orders,
 )
 
 app.include_router(products.router, prefix="/api/v1/products", tags=["产品管理"])
@@ -147,3 +193,5 @@ app.include_router(product_costs.router, prefix="/api/v1/products", tags=["产�
 app.include_router(data_source.router, prefix="/api/v1/data-source", tags=["数据来源核验"])
 app.include_router(app_info.router, prefix="/api/v1/app-info", tags=["应用信息"])
 app.include_router(semantic_classifications.router, prefix="/api/v1/semantic-classifications", tags=["缓存天数语义分类"])
+app.include_router(ops.router, prefix="/api/v1/ops", tags=["运维观测"])
+app.include_router(purchase_orders.router, prefix="/api/v1/purchase-orders", tags=["采购单产品明细"])

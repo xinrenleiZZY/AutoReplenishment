@@ -30,6 +30,7 @@ SYNC_RUNNERS = {
     "profit_report": "sync_profit_report",
     "purchase_sources": "sync_purchase_sources",
     "base_analysis": "sync_base_analysis",
+    "purchase_order_items": "sync_purchase_order_items",
 }
 
 

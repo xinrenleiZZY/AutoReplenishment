@@ -34,11 +34,10 @@ _token: str | None = None
 _expire_at: float = 0.0
 _session = requests.Session()
 
-# ── 本地直连缺省参数（.env 未配置时回退，与 scraper 内置兜底一致） ──
-_DEFAULT_COMPANY_ID = "90136117059997696"
-_DEFAULT_UID = "11054904"
-_DEFAULT_ENV_KEY = "huizhixin"
-_X_AK_VERSION = "3.8.9.3.0.185"
+# ── 本地直连参数（Phase 0 / G-03：不再硬编码租户信息，必须由 .env 提供） ──
+# 说明：原先此处硬编码 company-id / uid / env-key，属"配置进代码"；
+#       现改为只读 settings，缺失时明确报错，而不是静默使用内置值。
+_X_AK_VERSION = "3.8.9.3.0.185"   # 领星前端版本号（非敏感，仅用于请求头）
 _MAX_PAGES = 2000  # 直连翻页上限（防死循环）
 _OK_CODES = {0, 1, 200, "0", "1", "200", None}
 _AUTH_FAIL_CODES = {8003, "8003"}  # 领星鉴权失败（含 -999 顶号）
@@ -199,6 +198,19 @@ def _refresh_direct_token() -> str | None:
 
 def _direct_headers() -> dict:
     # 与 scraper/lingxing_product_scraper.py 的可用请求头保持一致（origin/referer 固定 huizhixin）
+    company_id = (settings.LX_HEADER_COMPANY_ID or "").strip()
+    uid = (settings.LX_HEADER_UID or "").strip()
+    env_key = (settings.LX_HEADER_ENV_KEY or "").strip() or "huizhixin"
+    missing = [name for name, val in (
+        ("LX_HEADER_COMPANY_ID", company_id),
+        ("LX_HEADER_UID", uid),
+    ) if not val]
+    if missing:
+        # 不再回退到硬编码租户，避免"配置缺失却仍能跑通"的隐性依赖
+        raise StationError(
+            "本地直连缺少配置: " + "、".join(missing) +
+            "（请在 .env 配置，或改用领星 API 服务站通道）"
+        )
     return {
         "accept": "application/json, text/plain, */*",
         "ak-client-type": "web",
@@ -209,12 +221,12 @@ def _direct_headers() -> dict:
         "referer": "https://huizhixin.lingxing.com/",
         "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"),
-        "x-ak-company-id": settings.LX_HEADER_COMPANY_ID or _DEFAULT_COMPANY_ID,
-        "x-ak-env-key": settings.LX_HEADER_ENV_KEY or _DEFAULT_ENV_KEY,
+        "x-ak-company-id": company_id,
+        "x-ak-env-key": env_key,
         "x-ak-language": "zh",
         "x-ak-platform": "1",
         "x-ak-request-source": "erp",
-        "x-ak-uid": settings.LX_HEADER_UID or _DEFAULT_UID,
+        "x-ak-uid": uid,
         "x-ak-version": _X_AK_VERSION,
         "x-ak-zid": "1",
     }

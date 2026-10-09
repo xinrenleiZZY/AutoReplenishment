@@ -12,7 +12,12 @@ from sqlalchemy import func, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session_factory, get_session
-from app.models.calculation import CalculationResult, CalculationStepResult, CalculationTimelineReset
+from app.models.calculation import (
+    CalculationResult,
+    CalculationStepResult,
+    CalculationTimelineReset,
+    CalculationSkipLog,
+)
 from app.models.product import Product
 from app.models.operator import Operator
 from app.models.ai_evaluation import AiEvaluation
@@ -29,6 +34,7 @@ from app.tasks.calculation_tasks import (
     reset_calculation_timeline,
     normalize_level,
     _normalize_levels,
+    _load_report_lifecycles,
 )
 from app.integrations.feishu import FeishuNotifier
 from app.services import config_service
@@ -41,10 +47,10 @@ logger = logging.getLogger(__name__)
 _jobs: dict[str, dict] = {}
 
 
-def _start_job(run_factory, progress: dict | None = None) -> str:
-    """提交后台任务并返回 job_id"""
+def _start_job(run_factory, progress: dict | None = None, kind: str | None = None) -> str:
+    """提交后台任务并返回 job_id；kind 用于区分任务来源，便于按来源查询/恢复"""
     job_id = uuid.uuid4().hex[:12]
-    _jobs[job_id] = {"job_id": job_id, "status": "running", "started_at": time.time(),
+    _jobs[job_id] = {"job_id": job_id, "kind": kind, "status": "running", "started_at": time.time(),
                      "finished_at": None, "stats": None, "error": None,
                      "progress": progress or {"total": 0, "done": 0, "percent": 0, "current_asin": None}}
 
@@ -1049,12 +1055,15 @@ async def _run_single_with_sync(asin: str, progress: dict | None = None) -> dict
 
     三项同步为全量同步（与定时任务同源同口径），耗时较长，故整体作为后台任务执行并回报进度。
     """
-    from app.tasks.sync_tasks import sync_sales_data, sync_inventory, sync_purchase_orders
+    from app.tasks.sync_tasks import (
+        sync_sales_data, sync_inventory, sync_purchase_orders, sync_purchase_order_items,
+    )
 
     steps = [
         ("同步销量数据", sync_sales_data),
         ("同步库存数据", sync_inventory),
         ("同步待到货量", sync_purchase_orders),
+        ("同步采购单产品明细", lambda: sync_purchase_order_items(mode="recent30")),
     ]
     total_steps = len(steps) + 1
     if progress is not None:
@@ -1307,6 +1316,14 @@ async def push_daily_report(session: AsyncSession = Depends(get_session)):
 async def _run_multi_asin_task(levels: str, lifecycles: str | None, with_report: bool,
                                with_image: bool, progress: dict | None = None) -> dict:
     """任务大厅-多ASIN任务：按「等级 + 生命周期」立即计算，可选生成并推送日报/大屏大图"""
+    if progress is not None:
+        progress["stage"] = "同步采购单产品明细"
+    try:
+        from app.tasks.sync_tasks import sync_purchase_order_items
+
+        await sync_purchase_order_items(mode="recent30")
+    except Exception as e:  # noqa: BLE001
+        logger.error("任务大厅-多ASIN 同步采购单产品明细失败: %s", e)
     stats = await run_level_calculation(levels, progress=progress, lifecycles=lifecycles)
     result: dict = {
         "levels": levels,
@@ -1367,8 +1384,18 @@ async def trigger_task_hall_multi(
     job_id = _start_job(
         lambda: _run_multi_asin_task(levels, lifecycles, with_report, with_image, progress),
         progress=progress,
+        kind="task-hall-multi",
     )
     return {"message": "多ASIN任务已提交", "job_id": job_id, "status": "running"}
+
+
+@router.get("/task-hall/multi/latest")
+async def latest_task_hall_multi():
+    """任务大厅-多ASIN任务：返回最近一次任务，供页面刷新后恢复进度/结果"""
+    jobs = [j for j in _jobs.values() if j.get("kind") == "task-hall-multi"]
+    if not jobs:
+        return {"job": None}
+    return {"job": max(jobs, key=lambda j: j["started_at"])}
 
 
 # 任务大厅-单ASIN定时私发任务（内存登记；API 重启后待执行任务丢失，需重新创建）
@@ -1484,3 +1511,82 @@ async def cancel_task_hall_single(task_id: str):
         except Exception:  # noqa: BLE001
             pass
     return {"message": "任务已取消"}
+
+
+# ==================== 运行事实可解释（Phase 0 / G-06） ====================
+
+@router.get("/skip-logs", summary="静默跳过记录（节日门禁等）")
+async def list_skip_logs(
+    calc_date: Optional[str] = Query(None, description="查询日期 YYYY-MM-DD，缺省今天"),
+    gate: Optional[str] = Query(None, description="按闸门过滤，如 '节日门禁'"),
+    limit: int = Query(200, ge=1, le=1000),
+    session: AsyncSession = Depends(get_session),
+):
+    """列出当日"静默跳过"的产品（不写 calculation_results，只写 calculation_skip_logs）。"""
+    try:
+        d = date.fromisoformat(calc_date.strip()) if calc_date else date.today()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="calc_date 格式错误，应为 YYYY-MM-DD")
+
+    q = select(CalculationSkipLog).where(CalculationSkipLog.calc_date == d)
+    if gate:
+        q = q.where(CalculationSkipLog.gate == gate.strip())
+    rows = (await session.execute(q.order_by(CalculationSkipLog.id.desc()).limit(limit))).scalars().all()
+
+    return {
+        "calc_date": d.isoformat(),
+        "count": len(rows),
+        "items": [
+            {
+                "asin": r.asin,
+                "gate": r.gate,
+                "festival": r.festival,
+                "festival_name": r.festival_name,
+                "next_festival_date": r.next_festival_date.isoformat() if r.next_festival_date else None,
+                "days_until": r.days_until,
+                "reason": r.reason,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/run-summary", summary="当日计算漏斗：到期 / 过滤 / 实际计算 / 跳过原因")
+async def calculation_run_summary(
+    calc_date: Optional[str] = Query(None, description="查询日期 YYYY-MM-DD，缺省今天"),
+    session: AsyncSession = Depends(get_session),
+):
+    """回答"今天为什么只算了 N 个"：把到期数、生命周期过滤配置、实际计算数、跳过原因并列。"""
+    try:
+        d = date.fromisoformat(calc_date.strip()) if calc_date else date.today()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="calc_date 格式错误，应为 YYYY-MM-DD")
+
+    due = await get_due_calculation_stats(session)
+    allowed_lifecycles = sorted(await _load_report_lifecycles(session))
+
+    computed = (await session.execute(
+        select(func.count()).select_from(CalculationResult).where(CalculationResult.calc_date == d)
+    )).scalar() or 0
+
+    skip_rows = (await session.execute(
+        select(CalculationSkipLog.gate, func.count())
+        .where(CalculationSkipLog.calc_date == d)
+        .group_by(CalculationSkipLog.gate)
+    )).all()
+
+    return {
+        "date": d.isoformat(),
+        "enabled_products": due.get("total"),
+        "due": due.get("due"),
+        "due_by_level": due.get("by_level"),
+        "allowed_lifecycles": allowed_lifecycles or None,
+        "computed": computed,
+        "skipped_by_gate": {g: c for g, c in skip_rows},
+        "notes": [
+            "到期中若无等级/无生命周期，会在「基础数据校验」被跳过且不写任何记录（G-1）",
+            "节日日期超过 180 天的产品会被「节日门禁」静默跳过并写入 skip-logs（G-2）",
+            "allowed_lifecycles 非空时，只有这些生命周期的到期产品会进入计算",
+            "computed 为当日实际写入 calculation_results 的条数",
+        ],
+    }

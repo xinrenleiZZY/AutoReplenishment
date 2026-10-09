@@ -275,12 +275,13 @@ async def main(dry_run: bool = False) -> dict:
     written = 0
     if not dry_run:
         today = date.today()
+        # Phase 1 / G-17：products 改批量写入（分块短事务 + 按 asin 排序 + lock_timeout + 死锁重试）
+        from app.services.db_bulk import update_products_purchase_on_order
+
+        written = await update_products_purchase_on_order(async_session_factory, pending_by_asin)
         async with async_session_factory() as s:
-            for asin, qty in pending_by_asin.items():
-                # 写回基础数据 products：分析直接用最新待到货量
-                await s.execute(
-                    update(Product).where(Product.asin == asin).values(purchase_on_order=qty)
-                )
+            # 当日快照同步（与 products 分开事务，缩短锁持有时间）
+            for asin, qty in sorted(pending_by_asin.items()):
                 row = (await s.execute(
                     select(InventorySnapshot).where(
                         InventorySnapshot.asin == asin,
@@ -295,7 +296,6 @@ async def main(dry_run: bool = False) -> dict:
                         fba_available=0, fba_reserved=0, fba_inbound=0,
                         fba_inbound_shipped=0, local_stock=0,
                     ))
-                written += 1
             await s.commit()
     print(f"已写入 inventory_snapshots.purchase_on_order：{written} 个 ASIN（{date.today()}）")
     await flush_raw()

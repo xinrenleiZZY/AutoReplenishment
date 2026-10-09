@@ -91,6 +91,14 @@ class SyncLogResponse(BaseModel):
     error_message: str | None = None
     started_at: datetime
     completed_at: datetime | None = None
+    # Phase 1 / G-16：可观测性扩展字段（旧记录为 null）
+    run_id: str | None = None
+    level: str | None = None
+    step: str | None = None
+    source: str | None = None
+    stats_json: str | None = None
+    duration_ms: int | None = None
+    retry_of: int | None = None
 
     model_config = {"from_attributes": True}
 

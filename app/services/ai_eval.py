@@ -24,6 +24,7 @@ from app.models.ai_evaluation import AiEvaluation
 from app.models.calculation import CalculationResult, CalculationStepResult
 from app.models.inventory import InventorySnapshot
 from app.models.product import Product
+from app.models.profit_report_stat import ProfitReportStat
 from app.models.sales import SalesData
 from app.models.sales_statistics import SalesStatisticsReport
 from app.services import new_product_policy
@@ -730,3 +731,162 @@ async def plan_batches_ai(
         await _save_evaluation(session, asin, "batch_plan", input_snapshot, fallback,
                                settings.DEEPSEEK_MODEL, "failed", int((time.time() - started) * 1000), err)
         return fallback
+
+
+def _num(val):
+    """安全转 float，失败/None 返回 None（保留"无该数据"语义）。"""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+async def evaluate_new_product_profit_space(
+    product: Product,
+    session: AsyncSession,
+    cost_table: dict | None = None,
+    inventory_days: int | None = None,
+) -> dict | None:
+    """新品「利润空间」DeepSeek 综合评分（**替换**原 毛利率×100 线性口径，作为新品利润空间唯一分数）
+
+    参与评分的 5 个条件：
+      C1 广告健康度（硬性 + 趋势）：整体 ACOS ≤ 55% 才通过（硬性指标）；趋势用 profit_report_stats
+         近30天 ads_cost/sales_amount 逐日现算 ACOS 序列判断向好/持平/恶化。
+      C2 Listing 质量：产品评分 stars、评论数 reviews_num。
+      C3 毛利/毛利率：领星经营利润报表（gross_rate / gross_profit / roi）。
+      C4 成本表 Profit（P0）：各运输渠道是否有盈利渠道。
+      C5 剩余售卖天数（P1）：库存可售天数 inventory_days。
+    分项合成权重：C1 30% / C2 15% / C3 20% / C4 25% / C5 10%。
+
+    硬性否决（veto=true，profit_score 直接归 0）：
+      · C1：整体 ACOS > 55%
+      · C4：成本表无任何盈利渠道
+      · C5：剩余售卖天数 ≤ 14 天
+
+    返回 {"status","profit_score","veto","veto_reason","sub_scores","factors","reason","confidence"}；
+    未启用 AI / 调用失败 → 返回 None（调用方按 0 计，不回退线性公式；函数内不做旧公式兜底）。
+    """
+    asin = getattr(product, "asin", "") or ""
+    if not ai_enabled():
+        logger.info(f"[{asin}] 新品利润空间 AI 评分跳过：未启用 DeepSeek")
+        return None
+
+    # ── C1 广告：整体 ACOS（产品档案）+ 近30天日 ACOS 序列（趋势） ──
+    acos_30d = _num(getattr(product, "acos_30d", None))
+    series: list[dict] = []
+    try:
+        rows = (await session.execute(
+            select(ProfitReportStat.stat_date, ProfitReportStat.ads_cost, ProfitReportStat.sales_amount)
+            .where(
+                ProfitReportStat.asin == asin,
+                ProfitReportStat.stat_date >= date.today() - timedelta(days=30),
+            )
+            .order_by(ProfitReportStat.stat_date)
+        )).all()
+        for d, ads, sales in rows:
+            ads_v, sales_v = _num(ads), _num(sales)
+            if ads_v is not None and sales_v and sales_v > 0:
+                series.append({"日期": d.isoformat(), "ACOS": round(ads_v / sales_v, 4)})
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[{asin}] 新品利润空间评分：ACOS 趋势读取失败: {e}")
+
+    # ── C3 毛利：经营利润报表最新一行 ──
+    latest = None
+    try:
+        latest = (await session.execute(
+            select(ProfitReportStat)
+            .where(ProfitReportStat.asin == asin)
+            .order_by(ProfitReportStat.stat_date.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[{asin}] 新品利润空间评分：利润报表读取失败: {e}")
+
+    # ── C4 成本表 Profit ──
+    ct = cost_table or {}
+    channels = ct.get("channels") or {}
+    channel_profits = {m: (c or {}).get("profit") for m, c in channels.items()}
+    profitable_modes = ct.get("profitable_modes") or [m for m, p in channel_profits.items() if (_num(p) or 0) > 0]
+
+    input_data = {
+        "asin": asin,
+        "产品名": getattr(product, "product_name", None),
+        "C1_广告": {"整体ACOS_30d": acos_30d, "近30天日ACOS序列": series},
+        "C2_Listing": {"评分": _num(getattr(product, "stars", None)),
+                       "评论数": getattr(product, "reviews_num", None)},
+        "C3_毛利": {
+            "毛利率": _num(getattr(latest, "gross_rate", None)) if latest else None,
+            "毛利额": _num(getattr(latest, "gross_profit", None)) if latest else None,
+            "ROI": _num(getattr(latest, "roi", None)) if latest else None,
+            "销售额": _num(getattr(latest, "sales_amount", None)) if latest else None,
+            "统计日期": latest.stat_date.isoformat() if latest and latest.stat_date else None,
+        },
+        "C4_成本表Profit": {"各渠道Profit": channel_profits, "有盈利渠道": profitable_modes},
+        "C5_剩余售卖天数": {"inventory_days": inventory_days},
+    }
+
+    system = (
+        "你是亚马逊跨境电商资深补货顾问，负责对【新品】的「利润空间」做综合评分（0~100）。"
+        "【唯一任务】只输出新品的利润空间评分与分项依据，不做销量预测、不给补货数量。"
+        "【评分条件】（必须全部覆盖，逐项给出依据）"
+        "C1 广告健康度（硬性门槛 + 趋势）：硬性——整体ACOS ≤ 55% 才通过，> 55% 该项判 0 分并在 veto=true 标注“ACOS超55%硬性不达标”；"
+        "缺 ACOS 数据时按“达标放行”处理并在 reason 注明“ACOS数据缺失”。"
+        "趋势——用「近30天日ACOS序列」判断：连续下降=向好(同档 +10)，平稳=中性，连续上升=恶化(同档 -10)，封顶[0,100]。"
+        "取值档位（通过硬性门槛后）：ACOS ≤20%→100；≤30%→85；≤40%→70；≤55%→50；>55%→0。"
+        "C2 Listing质量：结合「评分」与「评论数」。规则参考：评分≥4.3 且 评论数≥100→90~100；4.0~4.3→60~85；"
+        "3.5~4.0 或 评论数<20→30~60；<3.5→0~30。"
+        "C3 毛利/毛利率：以「毛利率」为主，「毛利额」「ROI」为辅。规则参考：≥30%→100；≥25%→85；≥20%→70；"
+        "≥15%→50；≥10%→30；(0,10%)→15；≤0→0。"
+        "C4 成本表Profit（P0）：以「各渠道Profit」为准，判断是否存在至少一个有利润渠道。"
+        "有盈利渠道→≥60（按盈利幅度给分）；全部渠道 Profit ≤ 0 → 0 分并 veto=true 标注“成本表P0无盈利渠道”。"
+        "C5 剩余售卖天数（P1）：≤14 天→0 分并 veto=true 标注“剩余售卖天数不足14天，终止加订”；"
+        "14~30 天→30~50；30~60 天→50~75；>60 天→75~100。"
+        "【重要常识】新品在“加订”阶段通常还不赚钱（C3 毛利率偏低甚至为负）是正常现象，不得因此直接判死；"
+        "应以 C4 成本表是否有盈利渠道、C1 广告是否在改善、C5 剩余售卖天数是否足够为主判断，C3 只作“盈利潜力”参考。"
+        "【合成权重】C1 30% / C2 15% / C3 20% / C4 25% / C5 10%，加权求和得 profit_score(0~100 整数)。"
+        "【否决优先】C1/C4/C5 任一触发否决时，veto=true 且 profit_score=0（即使其他项很高）。"
+        "【数字忠实性硬约束】文本中出现的数字必须逐字取自输入 JSON 对应字段，禁止估算/换算/臆造；缺失写“无该数据”。"
+        "请输出 JSON，格式："
+        '{"profit_score":0~100整数,"veto":true/false,"veto_reason":"触发否决的原因(无则 null)",'
+        '"sub_scores":{"C1_广告":整数,"C2_Listing":整数,"C3_毛利":整数,"C4_成本表":整数,"C5_剩余售卖天数":整数},'
+        '"factors":{"广告ACOS":"...","Listing":"...","毛利/成本":"...","剩余售卖天数":"..."},'
+        '"reason":"100-180字综合分析，说明各条件权衡与最终评分依据","confidence":"高|中|低"}'
+    )
+    user = json.dumps(input_data, ensure_ascii=False, default=str)
+    input_snapshot = {"system": system, "user": user}
+    started = time.time()
+    try:
+        content = await chat_completion([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ], max_tokens=4000, timeout=120)
+        parsed = _parse_json_text(content)
+        score = _num(parsed.get("profit_score"))
+        if score is None:
+            raise ValueError(f"AI 返回的 profit_score 非法: {parsed.get('profit_score')!r}")
+        score = min(100, max(0, int(round(score))))
+        veto = bool(parsed.get("veto"))
+        if veto:
+            score = 0
+        output = {
+            "status": "success",
+            "profit_score": score,
+            "veto": veto,
+            "veto_reason": parsed.get("veto_reason"),
+            "sub_scores": parsed.get("sub_scores") or {},
+            "factors": parsed.get("factors") or {},
+            "reason": parsed.get("reason"),
+            "confidence": parsed.get("confidence"),
+        }
+        await _save_evaluation(session, asin, "new_product_profit_space", input_snapshot, output,
+                               settings.DEEPSEEK_MODEL, "success", int((time.time() - started) * 1000))
+        return output
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        logger.warning(f"[{asin}] 新品利润空间 AI 评分失败（不回退线性公式，按0计）: {err}")
+        await _save_evaluation(session, asin, "new_product_profit_space", input_snapshot,
+                               {"status": "failed", "error": err},
+                               settings.DEEPSEEK_MODEL, "failed", int((time.time() - started) * 1000), err)
+        return None

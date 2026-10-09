@@ -516,6 +516,22 @@ export interface TaskHallMultiResult {
   };
 }
 
+export interface TaskHallMultiJob {
+  job_id: string;
+  status: "running" | "done" | "failed";
+  started_at: number | null;
+  finished_at: number | null;
+  stats: TaskHallMultiResult | null;
+  error: string | null;
+  progress?: {
+    total: number;
+    done: number;
+    percent: number;
+    current_asin: string | null;
+    stage?: string | null;
+  };
+}
+
 export interface TaskHallSingleTask {
   id: string;
   asin: string;
@@ -976,6 +992,8 @@ export const api = {
         `/api/v1/calculation/task-hall/multi${toQuery(params)}`,
         { method: "POST" }
       ),
+    taskHallMultiLatest: () =>
+      fetchJSON<{ job: TaskHallMultiJob | null }>("/api/v1/calculation/task-hall/multi/latest"),
     taskHallSingleList: () =>
       fetchJSON<{ tasks: TaskHallSingleTask[] }>("/api/v1/calculation/task-hall/single"),
     taskHallSingleCreate: (params: { asin: string; operator?: string; run_at?: string }) =>

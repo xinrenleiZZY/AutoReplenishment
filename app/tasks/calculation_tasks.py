@@ -945,9 +945,27 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
         suggested_qty = new_flow["suggested_qty"]
         batch_plan = new_flow["batch_plan"]
         scoring = new_flow["scoring"]
+        # 新品「利润空间」：DeepSeek 综合评分（C1广告/C2Listing/C3毛利/C4成本表/C5剩余天数）
+        # 作为新品利润空间的唯一分数；未启用/失败 → None → 传 0，不回退线性公式
+        new_profit_score = None
+        try:
+            _ct_for_ai = new_product_policy.calc_cost_table(product)
+        except Exception:  # noqa: BLE001
+            _ct_for_ai = None
+        try:
+            _ai_profit = await ai_eval.evaluate_new_product_profit_space(
+                product, session,
+                cost_table=_ct_for_ai,
+                inventory_days=inventory.get("inventory_days"),
+            )
+            if _ai_profit:
+                new_profit_score = _ai_profit.get("profit_score")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{asin}] 新品利润空间 AI 评分异常（按0计）: {e}")
         # 新品也计算六维评分（统一评分明细展示；等级仍以新品门禁为准）
         try:
-            six = _calc_score(forecast, inventory, life_cycle, trigger, product, purchase_window, lifecycle_end, True)
+            six = _calc_score(forecast, inventory, life_cycle, trigger, product, purchase_window, lifecycle_end, True,
+                              new_product_profit_score=new_profit_score)
             scoring.setdefault("score_detail", {})["六维评分"] = six["score_detail"]
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{asin}] 新品六维评分计算失败: {e}")
@@ -4995,10 +5013,13 @@ def _plan_batches(suggested_qty: int, product: Product, lead_time: int, festival
 
 def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
                 trigger: dict, product: Product, purchase_window: dict = None,
-                stage_end=None, is_new_product: bool = False) -> dict:
+                stage_end=None, is_new_product: bool = False,
+                new_product_profit_score: Optional[int] = None) -> dict:
     """计算采购评分（新老品两套逻辑）
 
-    新品（is_new_product=True）：沿用原六维线性评分 + SCORE_BALANCE_* 权重（默认1.0均分）。
+    新品（is_new_product=True）：六维评分 + SCORE_BALANCE_* 权重（默认1.0均分）；
+        其中「利润空间」唯一取自 DeepSeek 综合评分 new_product_profit_score（见
+        ai_eval.evaluate_new_product_profit_space），不再用毛利率线性公式，失败/缺省按 0，不回退。
     老品（is_new_product=False，默认）：按《老品采购评分指标》分档规则，权重 ①20%/②25%/③25%/④10%/⑤10%/⑥10%。
     """
     inventory_days = trigger.get("inventory_days")
@@ -5116,7 +5137,9 @@ def _calc_score(forecast: dict, inventory: dict, life_cycle: str,
         except Exception:
             profit_rate = 0.0
     if is_new_product:
-        profit_score = min(100, max(0, round(profit_rate * 100)))
+        # 新品「利润空间」唯一分数：DeepSeek evaluate_new_product_profit_space 综合评分
+        # （C1广告/C2Listing/C3毛利/C4成本表/C5剩余天数）；不做线性公式、不做失败回退，None → 0
+        profit_score = int(new_product_profit_score or 0)
     else:
         # ③ 利润空间(25%)：单件毛利率分档
         if profit_rate >= 0.10:

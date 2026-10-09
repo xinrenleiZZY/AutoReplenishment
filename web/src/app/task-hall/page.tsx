@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   api,
   type Operator,
+  type TaskHallMultiJob,
   type TaskHallMultiResult,
   type TaskHallSingleTask,
 } from "@/lib/api";
@@ -77,6 +78,55 @@ export default function TaskHallPage() {
     return () => clearInterval(timer);
   }, [singleTasks, loadTasks]);
 
+  // 轮询多ASIN任务直至结束（页面刷新后也能接管正在跑的任务）
+  const pollMultiJob = useCallback(async (jobId: string, first?: TaskHallMultiJob) => {
+    setRunning(true);
+    try {
+      let job: TaskHallMultiJob | undefined = first;
+      for (;;) {
+        if (job?.progress) setProgress(job.progress);
+        if (job && job.status !== "running") break;
+        await new Promise(r => setTimeout(r, 2000));
+        job = (await api.calculation.getJob(jobId)) as unknown as TaskHallMultiJob;
+      }
+      if (job.status === "failed") {
+        setMultiMsg({ ok: false, text: job.error || "任务执行失败" });
+      } else {
+        setMultiResult(job.stats ?? null);
+        setMultiMsg({ ok: true, text: "多ASIN任务已完成" });
+      }
+    } catch (e) {
+      setMultiMsg({ ok: false, text: e instanceof Error ? e.message : "任务执行失败" });
+    } finally {
+      setRunning(false);
+      setProgress(null);
+    }
+  }, []);
+
+  // 页面刷新后恢复最近一次多ASIN任务的进度/结果
+  useEffect(() => {
+    let cancelled = false;
+    api.calculation
+      .taskHallMultiLatest()
+      .then(r => {
+        if (cancelled || !r.job) return;
+        const job = r.job;
+        if (job.status === "running") {
+          setProgress(job.progress ?? { total: 0, done: 0, percent: 0, current_asin: null, stage: "计算" });
+          pollMultiJob(job.job_id, job);
+        } else if (job.status === "done") {
+          setMultiResult(job.stats ?? null);
+          setMultiMsg({ ok: true, text: "多ASIN任务已完成" });
+        } else if (job.status === "failed") {
+          setMultiMsg({ ok: false, text: job.error || "任务执行失败" });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pollMultiJob]);
+
   const toggleLevel = (lv: string) =>
     setLevels(prev => (prev.includes(lv) ? prev.filter(v => v !== lv) : [...prev, lv]));
   const toggleLifecycle = (lc: string) =>
@@ -98,19 +148,9 @@ export default function TaskHallPage() {
         with_report: withReport,
         with_image: withReport && withImage,
       });
-      let job = await api.calculation.getJob(res.job_id);
-      while (job.status === "running") {
-        if (job.progress) setProgress(job.progress);
-        await new Promise(r => setTimeout(r, 2000));
-        job = await api.calculation.getJob(res.job_id);
-      }
-      if (job.status === "failed") throw new Error(job.error || "任务执行失败");
-      const result = job.stats as unknown as TaskHallMultiResult | null;
-      setMultiResult(result);
-      setMultiMsg({ ok: true, text: "多ASIN任务已完成" });
+      await pollMultiJob(res.job_id);
     } catch (e) {
       setMultiMsg({ ok: false, text: e instanceof Error ? e.message : "任务执行失败" });
-    } finally {
       setRunning(false);
       setProgress(null);
     }

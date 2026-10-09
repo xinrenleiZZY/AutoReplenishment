@@ -36,6 +36,16 @@ def _record_result(log, session, status, total=None, success=None, error=None):
     session.add(log)
 
 
+def _finalize(log, session, stats, **kwargs):
+    """复用 scheduler 的终态判定与 stats 落库（函数内导入，避免模块循环依赖）。
+
+    对应整改方案 Phase 0 / G-14 与 Phase 1 / G-16。
+    """
+    from app.tasks.scheduler import _finalize as _f
+
+    return _f(log, session, stats, **kwargs)
+
+
 async def sync_products():
     """同步产品基础信息：showOnline 全量抓取 → 安全更新基础字段（不覆盖等级/工期/箱规等维护字段）"""
     log = SyncLog(sync_type="product", status="running")
@@ -63,7 +73,8 @@ async def sync_products():
         count = await import_products(json_path)
 
         async with session:
-            _record_result(log, session, "success", total=count, success=count)
+            _finalize(log, session, {"total": count, "written": count},
+                      total=count, success=count, zero_keys=("total",))
             await session.commit()
         logger.info(f"产品同步完成: {count} 条")
         await flush_raw()
@@ -94,7 +105,10 @@ async def sync_sales_data():
         records = await snapshot_to_daily()
 
         async with session:
-            _record_result(log, session, "success", total=records, success=records)
+            # 已抓取过/已转换时 records=0 属合法，故不做 0 判
+            _finalize(log, session, {"total": records, "written": records,
+                                     "snapshots": len(snapshots), "snapshot_date": str(snap_date)},
+                      total=records, success=records)
             await session.commit()
         logger.info(f"销量数据同步完成: {records} 条日明细")
         await flush_raw()
@@ -155,7 +169,8 @@ async def sync_inventory():
             raise RuntimeError("FBA库存同步全部通道失败（showOnline×1+MCP+showOnline×3）")
 
         async with session:
-            _record_result(log, session, "success", total=count, success=count)
+            _finalize(log, session, {"total": count, "written": count, "source": source},
+                      total=count, success=count, source=source, zero_keys=("total",))
             await session.commit()
         logger.info(f"FBA库存同步完成: {count} 条（{source}）")
         await flush_raw()
@@ -191,7 +206,8 @@ async def sync_box_quantity():
         )).scalar() or 0
 
         async with session:
-            _record_result(log, session, "success", total=count, success=count)
+            _finalize(log, session, {"total": count, "written": count},
+                      total=count, success=count, zero_keys=("total",))
             await session.commit()
         logger.info(f"箱规数据同步完成: {count} 条")
         await flush_raw()
@@ -208,6 +224,9 @@ async def sync_purchase_orders():
     """同步待到货量：采购订单 orderListsV2 首选，失败/未匹配到数据回退库存明细 storage/lists 的 pending_num"""
     log = SyncLog(sync_type="purchase_orders", status="running")
     session = async_session_factory()
+    attempts: list[str] = []
+    stats_po: dict = {}
+    stats_pending: dict = {}
     try:
         async with session:
             session.add(log)
@@ -216,34 +235,85 @@ async def sync_purchase_orders():
         from scripts.sync_purchase_orders import main as sync_po
 
         stats = await sync_po()
+        stats_po = stats if isinstance(stats, dict) else {}
         await flush_raw()
         matched = stats.get("asins", 0) if isinstance(stats, dict) else 0
         if matched:
             async with session:
-                _record_result(log, session, "success", total=matched, success=matched)
+                _finalize(log, session, stats_po, total=matched, success=matched,
+                          source="purchase_order")
                 await session.commit()
             logger.info("待到货量同步完成（采购订单首选）: %s", stats)
             return stats
+        attempts.append("采购订单通道未匹配到数据")
         logger.warning("采购订单通道未匹配到数据（%s），回退库存明细通道", stats)
     except Exception as e:  # noqa: BLE001
+        attempts.append(f"采购订单通道异常: {e}")
         logger.warning("采购订单通道异常（%s），回退库存明细通道", e)
     try:
         from scripts.sync_pending_stock import sync_pending_stock
 
         stats = await sync_pending_stock()
+        stats_pending = stats if isinstance(stats, dict) else {}
         await flush_raw()
         if stats.get("ok"):
             total = stats.get("ok", 0)
             async with session:
-                _record_result(log, session, "success", total=total, success=total)
+                _finalize(log, session, stats_pending, total=total, success=total,
+                          source="pending_stock", error_keys=("errors",))
                 await session.commit()
             logger.info("待到货量同步完成（库存明细兜底）: %s", stats)
             return stats
+        attempts.append("库存明细通道未匹配到数据")
         logger.warning("库存明细通道未匹配到数据（%s）", stats)
-    except Exception as e:  # noqa: BLE001
+        # 两条通道都没拿到数据 → 必须写终态，避免记录永久停留在 running（Phase 0 / G-14）
         async with session:
-            _record_result(log, session, "failed", error=e)
+            _finalize(log, session,
+                      {"purchase_order": stats_po, "pending_stock": stats_pending, "errors": attempts},
+                      total=0, success=0, source="none",
+                      error_keys=("errors",), zero_keys=("total",))
+            await session.commit()
+    except Exception as e:  # noqa: BLE001
+        attempts.append(f"库存明细通道异常: {e}")
+        async with session:
+            _finalize(log, session,
+                      {"purchase_order": stats_po, "pending_stock": stats_pending, "errors": attempts},
+                      total=0, success=0, source="none", error_keys=("errors",))
             await session.commit()
         logger.error("待到货量同步失败: %s", e)
+    finally:
+        await session.close()
+
+
+async def sync_purchase_order_items(mode: str = "full"):
+    """同步采购单产品明细：orderListsV2 全量入库（mode=full 全量 / recent30 近30天）
+
+    与现有每日 purchase_orders(待到货量) 任务相互独立：本任务只负责把采购单
+    产品明细完整落库到 purchase_order_items，不改动待到货量写入口径。
+    """
+    log = SyncLog(sync_type="purchase_order_items", status="running")
+    session = async_session_factory()
+    try:
+        async with session:
+            session.add(log)
+            await session.commit()
+
+        from scripts.sync_purchase_order_items import main as sync_items
+
+        stats = await sync_items(mode=mode)
+        await flush_raw()
+        async with session:
+            # Phase 0 / G-14：有 errors → partial/failed；written 为 0 → partial
+            _finalize(log, session, stats, source="orderListsV2",
+                      error_keys=("errors",), zero_keys=("written",))
+            await session.commit()
+        logger.info("采购单产品明细同步完成: %s", stats)
+        return stats
+    except Exception as e:  # noqa: BLE001
+        async with session:
+            _finalize(log, session, {"errors": [str(e)]}, source="orderListsV2",
+                      total=0, success=0, error_keys=("errors",))
+            await session.commit()
+        logger.error("采购单产品明细同步失败: %s", e)
     finally:
         await session.close()

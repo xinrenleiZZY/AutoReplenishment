@@ -16,8 +16,9 @@
             品名 → [(plan_sn, status_text, quantity_plan)]，一个品名对应 n 个计划编号；
       步骤2 逐个计划编号按状态分支取值：
             - 待采购/部分采购：待到货量 = 计划采购量(quantity_plan)，累加；
-            - 已完成：plan_sn → 采购单看板 relation_plan → wait_quantity
-                      (同一 plan_sn 在看板有多行时按 product_lists_raw.cg_price
+            - 已完成：plan_sn → 采购单明细子表 purchase_order_item.plan_sn →
+                      quantity_receive
+                      (同一 plan_sn 在明细有多行时按 purchase_order_item.price
                        取最贵那一行，不求和；全部取不到价格才回退求和)，存在即累加；
       步骤3 合计该品名的待到货量，写回对应产品的 purchase_on_order。
      匹配侧（系统产品）只按品名取最终数值，取不到即为 0（不再有降级兜底逻辑）。
@@ -35,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
@@ -53,9 +55,9 @@ from app.database import async_session_factory
 from app.models.inventory import InventorySnapshot
 from app.models.purchase_plan_items import PurchasePlanItem
 from app.models.purchase_order_board import PurchaseOrderBoard
+from app.models.purchase_order_item import PurchaseOrderItem
 from app.models.product import Product
-from app.models.product_lists_raw import ProductListsRaw
-from app.services.lx_station import station_proxy
+from app.services.lx_station import station_enabled, station_proxy
 from app.services.raw_store import collect_raw, flush_raw
 
 PLAN_NEW_URL = "https://huizhixin.lingxing.com/api/module/purchase/plan/listNew"
@@ -331,39 +333,27 @@ async def _plan_3m_by_name(session, cutoff: date) -> dict[str, list[tuple[str, s
     return m
 
 
-async def _board_wait_by_plan(session) -> dict[str, int]:
-    """步骤2：采购单看板 → relation_plan → wait_quantity
+async def _item_wait_by_plan(session) -> dict[str, int]:
+    """步骤2：采购单明细子表 → plan_sn → quantity_receive
 
-    看板为子件级明细：同一 relation_plan 下会同时出现主产品与子件(说明书/背卡/松紧绳等)
-    多行，且各行的 wait_quantity 完全相同，直接相加会成倍重复计数。
-    规则：用每行 product_name 去 product_lists_raw 查 cg_price(同名取最贵)，
-          取 cg_price 最大那一行的 wait_quantity；
-          若该 plan_sn 下所有行都查不到价格，则回退为原始求和。
+    明细子表为子件级明细：同一 plan_sn 下会同时出现主产品与子件(说明书/背卡/松紧绳等)
+    多行，直接相加会成倍重复计数。
+    规则：取该 plan_sn 下 price 最大的那一行的 quantity_receive；
+          若该 plan_sn 下所有行 price 均为空，则回退为原始求和。
     """
     rows = (await session.execute(
         select(
-            PurchaseOrderBoard.relation_plan,
-            PurchaseOrderBoard.product_name,
-            PurchaseOrderBoard.wait_quantity,
+            PurchaseOrderItem.plan_sn,
+            PurchaseOrderItem.price,
+            PurchaseOrderItem.quantity_receive,
         )
-        .where(PurchaseOrderBoard.relation_plan.isnot(None))
+        .where(PurchaseOrderItem.plan_sn.isnot(None))
     )).all()
 
-    price_rows = (await session.execute(
-        select(ProductListsRaw.product_name, ProductListsRaw.cg_price)
-        .where(ProductListsRaw.product_name.isnot(None))
-        .where(ProductListsRaw.cg_price.isnot(None))
-    )).all()
-    price_by_name: dict[str, Decimal] = {}
-    for pname, price in price_rows:
-        key = str(pname).strip()
-        if key not in price_by_name or price > price_by_name[key]:
-            price_by_name[key] = price
-
-    grouped: dict[str, list[tuple[str | None, int]]] = defaultdict(list)
-    for rp, pname, wq in rows:
-        if rp:
-            grouped[str(rp).strip()].append((pname, wq or 0))
+    grouped: dict[str, list[tuple[Decimal | None, int]]] = defaultdict(list)
+    for plan_sn, price, qty in rows:
+        if plan_sn:
+            grouped[str(plan_sn).strip()].append((price, qty or 0))
 
     m: dict[str, int] = {}
     for key, items in grouped.items():
@@ -372,8 +362,7 @@ async def _board_wait_by_plan(session) -> dict[str, int]:
             continue
         best_idx = -1
         best_price: Decimal | None = None
-        for i, (pname, _) in enumerate(items):
-            price = price_by_name.get(str(pname).strip()) if pname else None
+        for i, (price, _) in enumerate(items):
             if price is None:
                 continue
             if best_price is None or price > best_price:
@@ -382,7 +371,7 @@ async def _board_wait_by_plan(session) -> dict[str, int]:
         if best_idx >= 0:
             m[key] = items[best_idx][1]
         else:
-            m[key] = sum(w for _, w in items)
+            m[key] = sum(q for _, q in items)
     return m
 
 
@@ -392,13 +381,13 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
     步骤1：最近3个月采购计划明细(已完成/待采购/部分采购) → 品名 → [(plan_sn, status, qty)]。
     步骤2：逐个计划编号按状态分支取值并累加：
            - 待采购/部分采购：待到货量 = 计划采购量(quantity_plan)；
-           - 已完成：plan_sn → 采购单看板 relation_plan → wait_quantity（存在即累加）。
+           - 已完成：plan_sn → 采购单明细子表 plan_sn → quantity_receive（存在即累加）。
     步骤3：合计该品名待到货量，写回对应产品的 purchase_on_order（取不到即 0）。
     """
     cutoff = _months_ago(PLAN_LOOKBACK_MONTHS)
     async with async_session_factory() as s:
         name_plans = await _plan_3m_by_name(s, cutoff)
-        plan_to_wait = await _board_wait_by_plan(s)
+        plan_to_wait = await _item_wait_by_plan(s)
         prods = (await s.execute(
             select(Product.asin, Product.product_name)
         )).all()
@@ -406,7 +395,7 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
     # 步骤2+3：品名 → 待到货量（各计划编号按状态分支取值后合计）
     wait_by_name: dict[str, int] = {}
     direct_plans = 0      # 待采购/部分采购：直接取计划采购量
-    board_plans = 0       # 已完成：命中采购单看板
+    item_plans_hit = 0    # 已完成：命中采购单明细子表
     for key, plans in name_plans.items():
         total = 0
         for plan_sn, status_text, qty in plans:
@@ -417,7 +406,7 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
                 w = plan_to_wait.get(plan_sn)
                 if w:
                     total += w
-                    board_plans += 1
+                    item_plans_hit += 1
         wait_by_name[key] = total
 
     # 匹配侧：系统产品按品名直接取最终数值，取不到即 0
@@ -433,16 +422,16 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
         "cutoff": cutoff.isoformat(),
         "plan_names": len(name_plans),
         "plan_links": sum(len(v) for v in name_plans.values()),
-        "board_plans": len(plan_to_wait),
+        "item_plans": len(plan_to_wait),
         "direct_plans": direct_plans,
-        "board_hit_plans": board_plans,
+        "item_hit_plans": item_plans_hit,
         "matched_asins": len(wait_by_asin),
         "wait_total": sum(wait_by_asin.values()),
         "sample": sorted(wait_by_asin.items(), key=lambda x: -x[1])[:10],
     }
     print(f"ASIN待到货量: 采购计划品名 {len(name_plans)} 个(计划编号 {stats['plan_links']} 个)、"
-          f"看板计划 {len(plan_to_wait)} 个；按状态取值：待采购/部分采购 {direct_plans} 个、"
-          f"已完成命中看板 {board_plans} 个；匹配 ASIN {len(wait_by_asin)} 个，"
+          f"采购单明细计划 {len(plan_to_wait)} 个；按状态取值：待采购/部分采购 {direct_plans} 个、"
+          f"已完成命中明细 {item_plans_hit} 个；匹配 ASIN {len(wait_by_asin)} 个，"
           f"合计 {stats['wait_total']}（{cutoff} 起）")
     for asin, qty in stats["sample"]:
         print(f"  {asin}: 待到货 {qty}")
@@ -451,18 +440,19 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
         return stats
 
     today = date.today()
+    # Phase 1 / G-17：清零走独立短事务；products 明细走批量写入（分块 + 统一加锁顺序 + 死锁重试）
+    from app.services.db_bulk import replace_purchase_on_order
+
+    # 原子替换：清零 + 写入同一事务（避免中途失败把所有产品待到货量清成 0）
+    await replace_purchase_on_order(async_session_factory, wait_by_asin)
     async with async_session_factory() as s:
-        # 先清零（全量口径，替换历史上旧的待到货量，避免残留）
-        await s.execute(update(Product).values(purchase_on_order=0))
+        # 当日快照清零 + 回写（与 products 分开事务）
         await s.execute(
             update(InventorySnapshot)
             .where(InventorySnapshot.snapshot_date == today)
             .values(purchase_on_order=0)
         )
-        for asin, qty in wait_by_asin.items():
-            await s.execute(
-                update(Product).where(Product.asin == asin).values(purchase_on_order=qty)
-            )
+        for asin, qty in sorted(wait_by_asin.items()):
             row = (await s.execute(
                 select(InventorySnapshot).where(
                     InventorySnapshot.asin == asin,
@@ -485,22 +475,43 @@ async def sync_asin_wait_quantity(dry_run: bool = False) -> dict:
 
 async def main(dry_run: bool = False, board_start: str | None = None, board_end: str | None = None,
                board_all: bool = False) -> dict:
+    """三步抓取（计划明细 / 采购单看板 / ASIN待到货量）。
+
+    Phase 0 / G-14：本函数仍逐步骤容错（一步失败不影响其余步骤），但必须把
+    「每步成败、条数、错误」显式放进 stats，供 scheduler 判定 success/partial/failed。
+    """
     stats = {"dry_run": dry_run}
+    stats["source"] = "station" if station_enabled() else "direct"
+    steps: dict[str, dict] = {}
+    t0 = time.monotonic()
     try:
         await sync_purchase_plan_items(stats, dry_run)
+        steps["plan_items"] = {"ok": True, "total": stats.get("plan_items_total"),
+                               "written": stats.get("plan_items_written")}
     except Exception as e:
         stats["plan_items_error"] = str(e)
+        steps["plan_items"] = {"ok": False, "error": str(e)[:500]}
         print(f"[ERROR] 采购计划(listNew)同步失败: {e}")
     try:
         await sync_purchase_board(stats, dry_run, start_date=board_start, end_date=board_end, all_time=board_all)
+        steps["board"] = {"ok": True, "total": stats.get("board_total"),
+                          "written": stats.get("board_written")}
     except Exception as e:
         stats["board_error"] = str(e)
+        steps["board"] = {"ok": False, "error": str(e)[:500]}
         print(f"[ERROR] 采购单看板同步失败: {e}")
     try:
-        await sync_asin_wait_quantity(dry_run=dry_run)
+        wait_stats = await sync_asin_wait_quantity(dry_run=dry_run)
+        steps["wait_quantity"] = {"ok": True, "matched_asins": (wait_stats or {}).get("matched_asins"),
+                                  "wait_total": (wait_stats or {}).get("wait_total")}
     except Exception as e:
         stats["wait_error"] = str(e)
+        steps["wait_quantity"] = {"ok": False, "error": str(e)[:500]}
         print(f"[ERROR] ASIN待到货量计算失败: {e}")
+
+    stats["steps"] = steps
+    stats["ok"] = not any(stats.get(k) for k in ("plan_items_error", "board_error", "wait_error"))
+    stats["duration_ms"] = int((time.monotonic() - t0) * 1000)
     await flush_raw()
     print(f"\n结果: {json.dumps(stats, ensure_ascii=False)}")
     return stats

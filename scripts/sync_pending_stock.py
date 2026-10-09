@@ -141,18 +141,19 @@ async def sync_pending_stock(dry_run: bool = False) -> dict:
         return stats
 
     today = date.today()
+    # Phase 1 / G-17：清零走独立短事务；products 明细走批量写入（避免长事务死锁）
+    from app.services.db_bulk import replace_purchase_on_order
+
+    # 原子替换：清零 + 写入同一事务，避免"清零后写入失败"导致全量为 0
+    written = await replace_purchase_on_order(async_session_factory, pending_by_asin)
     async with async_session_factory() as s:
-        # 先清零（库存明细为全量口径，避免旧订单残留）：products 全部 + 当日快照全部
-        await s.execute(update(Product).values(purchase_on_order=0))
+        # 当日快照清零 + 回写（与 products 分开事务）
         await s.execute(
             update(InventorySnapshot)
             .where(InventorySnapshot.snapshot_date == today)
             .values(purchase_on_order=0)
         )
-        for asin, qty in pending_by_asin.items():
-            await s.execute(
-                update(Product).where(Product.asin == asin).values(purchase_on_order=qty)
-            )
+        for asin, qty in sorted(pending_by_asin.items()):
             row = (await s.execute(
                 select(InventorySnapshot).where(
                     InventorySnapshot.asin == asin,

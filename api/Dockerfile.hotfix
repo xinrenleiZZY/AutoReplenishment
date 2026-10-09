@@ -1,0 +1,31 @@
+# 代码热修镜像（无需外网依赖）
+#
+# 用途：当只需要部署「代码改动」而不改依赖时，以现有可运行镜像为基底，仅覆盖代码目录，
+#       避免重新拉取 python:3.12-slim-bookworm 基础镜像（内网环境常常不可达）。
+#
+# 与 api/Dockerfile 的关系：
+#   · api/Dockerfile         = 规范构建（从基础镜像重建，改依赖时使用）
+#   · api/Dockerfile.hotfix  = 快速构建（复用现有镜像层，仅代码变化时使用）
+#
+# 用法：
+#   docker build -f api/Dockerfile.hotfix -t yy021--api:latest .
+#   docker compose up -d api
+#
+# 注意：BASE_IMAGE 必须指向一个已存在的本地 API 镜像（构建前可用 docker images 确认）。
+ARG BASE_IMAGE=yy021--api:latest
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+COPY app ./app
+COPY api ./api
+COPY alembic ./alembic
+COPY alembic.ini ./
+COPY scripts ./scripts
+COPY scraper ./scraper
+COPY utils ./utils
+COPY browser_api ./browser_api
+COPY .mcp.json ./
+
+# 基础镜像中已创建 appuser 且已 chown /app；此处仅覆盖文件内容，保持运行用户不变
+USER appuser
