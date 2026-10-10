@@ -1,4 +1,4 @@
-# Phase 1 / G-10：按 commit SHA 打标的发布脚本（构建 → 打标 → 切换 → 冒烟）
+﻿# Phase 1 / G-10：按 commit SHA 打标的发布脚本（构建 → 打标 → 切换 → 冒烟）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\release.ps1                # 发布当前 HEAD

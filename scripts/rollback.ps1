@@ -1,4 +1,4 @@
-# Phase 1 / G-10：按镜像标签回滚（默认回到上一次发布前的标签）
+﻿# Phase 1 / G-10：按镜像标签回滚（默认回到上一次发布前的标签）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\rollback.ps1                 # 回到 _tmp\last_release.json 记录的上一版
