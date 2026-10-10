@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     # 规则见 docs/版本与发布规范.md：与 git tag 同名（V1.2.0 = 2026-10 企业级改造）
     APP_VERSION: str = "1.2.0"
 
+    # ── Phase 3 / B-03：调度器归属 ──
+    # true（默认，兼容旧部署）= APScheduler 跑在 API 进程内；
+    # false = API 不启动调度器，由独立 scheduler 服务（app/scheduler_service.py）负责，
+    #         此时 API 重启不影响定时同步/计算任务。两种模式**不能同时开启**。
+    RUN_SCHEDULER_IN_API: bool = True
+
     # 数据库
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/auto_replenishment"
 

@@ -28,12 +28,40 @@ services:
       - LX_CDP_PORT=18899
       # 复用现有独立数据库容器（auto_replenish_db，端口5433）
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5433/auto_replenishment
+      # Phase 3 / B-03：调度器外置——API 不再跑 APScheduler，定时任务交给 scheduler 服务
+      - RUN_SCHEDULER_IN_API=false
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
       interval: 30s
       timeout: 10s
       start_period: 20s
       retries: 3
+
+  # ── Phase 3 / B-03：独立调度服务（与 API 同一镜像，仅入口不同）──
+  scheduler:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    container_name: auto_replenish_scheduler
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - TZ=Asia/Shanghai
+      - APP_ENV=production
+      - LX_CDP_HOST=host.docker.internal
+      - LX_CDP_PORT=18899
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5433/auto_replenishment
+    command: ["python", "-m", "app.scheduler_service"]
+    # 调度服务没有 HTTP 端口，镜像自带的 /health 健康检查不适用 → 关闭
+    healthcheck:
+      disable: true
+    depends_on:
+      api:
+        condition: service_healthy
 
   web:
     build:

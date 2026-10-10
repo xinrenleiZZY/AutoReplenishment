@@ -29,8 +29,10 @@ if ($LASTEXITCODE -ne 0) { throw "本地不存在镜像 auto_replenish_api:$Tag"
 docker tag "auto_replenish_api:$Tag" yy021--api:latest
 docker image inspect "auto_replenish_web:$Tag" *> $null
 if ($LASTEXITCODE -eq 0) { docker tag "auto_replenish_web:$Tag" yy021--web:latest } else { Write-Warning "无 auto_replenish_web:$Tag，仅回滚 api" }
+docker image inspect "auto_replenish_scheduler:$Tag" *> $null
+if ($LASTEXITCODE -eq 0) { docker tag "auto_replenish_scheduler:$Tag" yy021--scheduler:latest } else { Write-Warning "无 auto_replenish_scheduler:$Tag，调度服务不回滚" }
 
-docker compose up -d --force-recreate api web
+docker compose up -d --force-recreate api web scheduler
 if ($LASTEXITCODE -ne 0) { throw "容器回滚失败" }
 
 Start-Sleep -Seconds 12

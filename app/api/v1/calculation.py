@@ -1460,6 +1460,14 @@ _single_tasks: dict[str, dict] = {}
 
 async def _run_single_notify_task(task: dict) -> None:
     """执行单ASIN报告私发任务：全量重拉三项数据 → 计算 → 私发负责人"""
+    # Phase 3 / B-03：外置调度器可能已注册但用户随后取消了任务 → 执行前复核，避免误发
+    try:
+        row = await job_store.fetch_job(task.get("id") or task.get("task_id"))
+        if row and row.get("status") == "cancelled":
+            logger.info("任务已取消，跳过执行 task_id=%s", task.get("id"))
+            return
+    except Exception as e:  # noqa: BLE001
+        logger.warning("执行前复核任务状态失败（继续执行）: %s", e)
     task["status"] = "running"
     task["started_at"] = datetime.now().isoformat(timespec="seconds")
     await job_store.save_task_hall_single(task)   # Phase 3 / B-04：落库留痕
@@ -1523,25 +1531,30 @@ async def create_task_hall_single(
         from app.tasks.scheduler import get_scheduler
 
         scheduler = get_scheduler()
-        if scheduler is None:
-            raise HTTPException(status_code=503, detail="调度器未启动，无法创建定时任务")
         try:
             run_dt = datetime.fromisoformat(run_at)
         except ValueError:
             raise HTTPException(status_code=400, detail="定时时间格式不正确（应为 ISO，如 2026-10-08T09:00）")
         if run_dt <= datetime.now():
             raise HTTPException(status_code=400, detail="定时时间需晚于当前时间")
+        task["status"] = "scheduled"
         _single_tasks[task_id] = task
         await job_store.save_task_hall_single(task)   # B-04：定时任务落库（重启后可恢复）
-        scheduler.add_job(
-            _run_single_notify_task,
-            trigger=DateTrigger(run_date=run_dt),
-            args=[task],
-            id=f"task_hall_single_{task_id}",
-            name=f"单ASIN私发 {asin}",
-            replace_existing=True,
-        )
-        return {"message": f"定时任务已创建，将于 {run_dt:%Y-%m-%d %H:%M} 执行", "task": task}
+        if scheduler is not None:
+            scheduler.add_job(
+                _run_single_notify_task,
+                trigger=DateTrigger(run_date=run_dt),
+                args=[task],
+                id=f"task_hall_single_{task_id}",
+                name=f"单ASIN私发 {asin}",
+                replace_existing=True,
+            )
+            return {"message": f"定时任务已创建，将于 {run_dt:%Y-%m-%d %H:%M} 执行", "task": task}
+        # Phase 3 / B-03：调度器已外置为独立服务 → 由调度服务轮询 task_jobs 并注册执行
+        return {
+            "message": f"定时任务已登记，将于 {run_dt:%Y-%m-%d %H:%M} 由调度服务执行",
+            "task": task,
+        }
 
     _single_tasks[task_id] = task
     await job_store.save_task_hall_single(task)       # B-04：立即任务落库

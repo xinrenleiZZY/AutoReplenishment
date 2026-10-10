@@ -24,19 +24,21 @@ Write-Host "== 发布 commit $sha ==" -ForegroundColor Cyan
 # 记住上一次的 api 标签，便于回滚
 $prev = (docker images auto_replenish_api --format "{{.Tag}}" | Where-Object { $_ -ne "latest" } | Select-Object -First 1)
 $prevWeb = (docker images auto_replenish_web --format "{{.Tag}}" | Where-Object { $_ -ne "latest" } | Select-Object -First 1)
+$prevSched = (docker images auto_replenish_scheduler --format "{{.Tag}}" | Where-Object { $_ -ne "latest" } | Select-Object -First 1)
 
 Write-Host "1/4 构建镜像..." -ForegroundColor Yellow
 $env:GIT_SHA = $sha   # 烧进镜像，供冒烟时核对"容器跑的版本 = 本次 commit"
-docker compose build api web
+docker compose build api web scheduler
 if ($LASTEXITCODE -ne 0) { throw "构建失败，已中止（未切换容器）" }
 
 Write-Host "2/4 打标 $sha ..." -ForegroundColor Yellow
 docker tag yy021--api "auto_replenish_api:$sha"
 docker tag yy021--web "auto_replenish_web:$sha"
+docker tag yy021--scheduler "auto_replenish_scheduler:$sha"
 if ($LASTEXITCODE -ne 0) { throw "打标失败" }
 
 Write-Host "3/4 切换容器..." -ForegroundColor Yellow
-docker compose up -d api web
+docker compose up -d api web scheduler
 if ($LASTEXITCODE -ne 0) { throw "容器切换失败" }
 
 if (-not $SkipSmoke) {
@@ -64,6 +66,9 @@ if (-not $SkipSmoke) {
         $inner = (docker exec auto_replenish_api printenv APP_BUILD_SHA).Trim()
         Write-Host "  容器内 APP_BUILD_SHA => $inner（本次 $sha）"
         if ($inner -ne $sha) { $ok = $false; Write-Warning "  容器内版本与本次发布不一致，请用 --force-recreate 重新切换" }
+        $innerSched = (docker exec auto_replenish_scheduler printenv APP_BUILD_SHA).Trim()
+        Write-Host "  scheduler 容器 APP_BUILD_SHA => $innerSched（本次 $sha）"
+        if ($innerSched -ne $sha) { $ok = $false; Write-Warning "  scheduler 容器版本与本次发布不一致（注意：scheduler 是独立服务，需单独 build）" }
     } catch { Write-Warning "  APP_BUILD_SHA 读取失败: $_" }
     Remove-Item Env:\GIT_SHA -ErrorAction SilentlyContinue
     if (-not $ok) {
@@ -79,6 +84,7 @@ $record = [pscustomobject]@{
     image_tag     = $sha
     previous_api  = $prev
     previous_web  = $prevWeb
+    previous_scheduler = $prevSched
 }
 $record | ConvertTo-Json | Out-File -Encoding utf8 "$root\_tmp\last_release.json"
 Write-Host "发布记录：_tmp\last_release.json（如需回滚：scripts\rollback.ps1）" -ForegroundColor Cyan

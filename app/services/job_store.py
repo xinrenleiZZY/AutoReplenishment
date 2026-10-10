@@ -13,7 +13,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, or_, select, update
 
 from app.database import async_session_factory
 from app.models.task_job import TaskJob
@@ -172,18 +172,28 @@ async def list_jobs(kind: str | None = None, limit: int = 50) -> list[dict]:
         }
         for r in rows
     ]
-async def mark_orphan_running_interrupted() -> int:
+async def mark_orphan_running_interrupted(*, exclude_kinds: tuple[str, ...] | None = None,
+                                          only_kinds: tuple[str, ...] | None = None) -> int:
     """启动时把"上次进程遗留的 running 任务"标记为 interrupted。
 
     当前是单 worker 部署：进程一重启，内存里的执行协程就没了，DB 里任何
     running 行都必然是孤儿行。等 6 小时巡检太慢（页面会一直显示"运行中"），
     所以在启动时立即判定。若将来改成多副本，需要改为按 owner/heartbeat 判定。
+
+    Phase 3 / B-03：任务大厅单ASIN任务由**独立调度服务**执行，因此
+      · API 进程只清 kind != task-hall-single 的孤儿（exclude_kinds）；
+      · 调度服务只清 kind == task-hall-single 的孤儿（only_kinds）。
     """
     try:
+        cond = [TaskJob.status == "running"]
+        if only_kinds:
+            cond.append(TaskJob.kind.in_(only_kinds))
+        if exclude_kinds:
+            cond.append(or_(TaskJob.kind.is_(None), TaskJob.kind.notin_(exclude_kinds)))
         async with async_session_factory() as s:
             res = await s.execute(
                 update(TaskJob)
-                .where(TaskJob.status == "running")
+                .where(*cond)
                 .values(status="interrupted", completed_at=datetime.now(),
                         error_message="进程重启：任务已中断，可重新触发")
             )
@@ -224,7 +234,7 @@ async def pending_scheduled_singles() -> list[dict]:
         async with async_session_factory() as s:
             rows = (await s.execute(
                 select(TaskJob).where(TaskJob.kind == "task-hall-single",
-                                      TaskJob.status == "scheduled")
+                                      TaskJob.status.in_(("scheduled", "pending")))
             )).scalars().all()
     except Exception as e:  # noqa: BLE001
         logger.warning("读取待执行定时任务失败: %s", e)

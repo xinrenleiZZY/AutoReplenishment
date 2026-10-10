@@ -71,15 +71,22 @@ async def lifespan(app: FastAPI):
         logger.info(f"启动巡检：标记 {n} 条超时 running 同步记录为 interrupted")
     except Exception as e:
         logger.error(f"启动巡检（超时 running 记录）失败: {e}")
-    scheduler = setup_scheduler()
-    set_scheduler(scheduler)
-    scheduler.start()
+    # Phase 3 / B-03：调度器归属可切换——外置模式下 API 不再启动 APScheduler
+    scheduler = None
+    if settings.RUN_SCHEDULER_IN_API:
+        scheduler = setup_scheduler()
+        set_scheduler(scheduler)
+        scheduler.start()
+        logger.info("进程内调度器已启动（RUN_SCHEDULER_IN_API=true）")
+    else:
+        logger.info("进程内调度器未启动（RUN_SCHEDULER_IN_API=false），定时任务由独立 scheduler 服务负责")
     # Phase 3 / B-04：后台任务持久化巡检 + 恢复未到期的定时任务
     try:
         from app.services import job_store
 
-        # 单 worker 部署：进程一重启，内存里的执行协程即消失 → 遗留 running 行立即判为中断
-        n = await job_store.mark_orphan_running_interrupted()
+        # 单 worker 部署：进程一重启，内存里的执行协程即消失 → 遗留 running 行立即判为中断。
+        # B-03：任务大厅单ASIN任务由调度服务执行，这里不碰（否则会误标别人的在跑任务）。
+        n = await job_store.mark_orphan_running_interrupted(exclude_kinds=("task-hall-single",))
         logger.info(f"启动巡检：标记 {n} 条遗留 running 后台任务为 interrupted")
         n2 = await job_store.mark_stale_running_interrupted(6)
         logger.info(f"启动巡检：标记 {n2} 条超时后台任务为 interrupted")
@@ -93,7 +100,7 @@ async def lifespan(app: FastAPI):
         from app.api.v1.calculation import _run_single_notify_task, _single_tasks
         from app.services.job_store import pending_scheduled_singles
 
-        for p in await pending_scheduled_singles():
+        for p in (await pending_scheduled_singles()) if scheduler is not None else []:
             if not p.get("asin") or not p.get("run_at"):
                 continue
             run_dt = datetime.fromisoformat(str(p["run_at"]))
@@ -116,7 +123,8 @@ async def lifespan(app: FastAPI):
         logger.error(f"启动恢复定时任务失败: {e}")
     yield
     # 关闭时
-    scheduler.shutdown()
+    if scheduler is not None:
+        scheduler.shutdown()
     await close_db()
 
 
