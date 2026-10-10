@@ -71,6 +71,9 @@ PARAM_DEFS: dict[str, tuple] = {
                         "新品等级评定各生命周期阶段系数（JSON，[预测销量系数,安全系数]）；启动期按 系数^(天数/10) 逐日累加", "str"),
     "decline_profit_threshold": ("0.35", "下降期巨大利润采购阈值（海运毛利率≥该值允许采购，否则不采购）", "str"),
     "no_replenish_stock_cap": ("2000", "库存充足不加订阈值（FBA可售+在途合计≥该值直接不加订）", "int"),
+    # ── Phase 3 / B-07 数据治理：保留期（0=不清理；清理动作由 scripts 显式执行，不静默删数据）──
+    "raw_retention_days": (90, "原始接口响应(api_raw_responses)保留天数；早于该天数的行可由治理脚本归档/删除", "int"),
+    "p_id_retention_days": (180, "p_id 抓取产物(sales_history/sellable_gap/sif_lifecycle)保留天数", "int"),
 }
 
 

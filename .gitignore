@@ -67,6 +67,12 @@ p_id/sellable_gap/
 # Alembic
 alembic/versions/*.pyc
 
+# 数据治理归档目录（Phase 3 / B-07：归档产物不入版本控制）
+_archive/
+
+# 本地临时工具/备份（C1 拆分脚本、回归基线等）
+_tmp/
+
 # Test
 .coverage
 htmlcov/

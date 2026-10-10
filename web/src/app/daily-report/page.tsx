@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, type DailyReport } from "@/lib/api";
+import ConfirmButton from "@/components/ConfirmButton";
 
 const LEVEL_STYLE: Record<string, { bg: string; color: string }> = {
   "立即采购": { bg: "#fef3c7", color: "#92400e" },
@@ -80,9 +81,10 @@ export default function DailyReportPage() {
             style={{ backgroundColor: aiRunning ? "#94a3b8" : "var(--bg-tertiary)", color: "var(--text-primary)" }}>
             {aiRunning ? "AI 生成中..." : "AI 生成日报"}
           </button>
-          {report && <button onClick={pushToFeishu} disabled={pushing}
+          {report && <ConfirmButton onConfirm={pushToFeishu} disabled={pushing}
+            confirmText="确认推送到飞书？"
             className="px-4 py-1.5 rounded-md text-sm font-medium text-white"
-            style={{ backgroundColor: pushing ? "#94a3b8" : "var(--accent-green)" }}>{pushing ? "推送中..." : "推送飞书（@负责人）"}</button>}
+            style={{ backgroundColor: pushing ? "#94a3b8" : "var(--accent-green)" }}>{pushing ? "推送中..." : "推送飞书（@负责人）"}</ConfirmButton>}
         </div>
       </div>
       {message && (

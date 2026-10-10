@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type CalculationRunSummary, type CalculationSkipLog, type OpsAlert, type SyncLog } from "@/lib/api";
+import ConfirmButton from "@/components/ConfirmButton";
 
 const TYPE_LABEL: Record<string, string> = {
   product: "📦 产品同步",
@@ -138,15 +139,16 @@ export default function SyncLogsPage() {
         <h2 className="text-sm font-semibold mb-3">立即同步</h2>
         <div className="flex flex-wrap gap-2">
           {SYNC_TYPES.map(t => (
-            <button
+            <ConfirmButton
               key={t}
-              onClick={() => trigger(t)}
+              onConfirm={() => trigger(t)}
+              confirmText={`确认立即同步「${TYPE_LABEL[t]}」？`}
               disabled={running !== null}
               className="px-3 py-1.5 rounded-md text-sm font-medium text-white"
               style={{ backgroundColor: running ? "#94a3b8" : "var(--accent-blue)" }}
             >
               {running === t ? "同步中..." : TYPE_LABEL[t]}
-            </button>
+            </ConfirmButton>
           ))}
         </div>
         {running && <p className="text-xs mt-2" style={{ color: "var(--accent-blue)" }}>后台同步进行中，完成后自动刷新日志…</p>}

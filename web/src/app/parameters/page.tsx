@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, type ConfigParamItem } from "@/lib/api";
+import ConfirmButton from "@/components/ConfirmButton";
 
 export default function ParametersPage() {
   const [params, setParams] = useState<ConfigParamItem[]>([]);
@@ -87,13 +88,14 @@ export default function ParametersPage() {
                 return (
                 <tr key={p.key} style={{ borderBottom: "1px solid var(--border-color)", backgroundColor: dirty ? "rgba(46,204,113,0.08)" : "transparent" }}>
                   <td className="py-2 pr-3 text-center">
-                    <button
-                      onClick={() => save(p.key)}
+                    <ConfirmButton
+                      onConfirm={() => save(p.key)}
+                      confirmText="确认保存该参数？"
                       className="px-3 py-1 rounded-md text-xs font-medium text-white"
                       style={{ backgroundColor: "var(--accent-green)" }}
                     >
                       保存
-                    </button>
+                    </ConfirmButton>
                   </td>
                   <td className="py-2 pr-3 whitespace-nowrap">
                     {dirty ? <span style={{ color: "var(--accent-green)" }}>● 修改中</span> : <span style={{ color: "var(--text-tertiary)" }}>已保存</span>}

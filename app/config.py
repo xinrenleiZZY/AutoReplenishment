@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     APP_DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
     APP_NAME: str = "自动补货决策系统"  # 应用名称（前端据此展示）
-    APP_VERSION: str = "3.9.17"        # 应用版本号（前端经 /api/v1/app-info 动态读取）
+    # 应用版本号（前端经 /api/v1/app-info 动态读取）
+    # 规则见 docs/版本与发布规范.md：与 git tag 同名（V1.2.0 = 2026-10 企业级改造）
+    APP_VERSION: str = "1.2.0"
 
     # 数据库
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/auto_replenishment"
