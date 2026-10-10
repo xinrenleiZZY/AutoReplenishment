@@ -14,6 +14,7 @@ router = APIRouter()
 
 class ConfigUpdate(BaseModel):
     value: str
+    operator: str | None = None  # Phase 1 / G-12：参数变更留痕要记录"谁改的"
 
 
 @router.get("")
@@ -53,11 +54,22 @@ async def _apply_listing_override(session: AsyncSession, key: str) -> None:
     await config_service.touch_asin_list(session)
 
 
+@router.get("/audits", summary="参数变更历史（谁/何时/旧值/新值）")
+async def list_param_audits(
+    key: str | None = None,
+    limit: int = 100,
+    session: AsyncSession = Depends(get_session),
+):
+    """Phase 1 / G-12：回答"谁把日报范围改成 3 个生命周期"。"""
+    return await config_service.list_audits(session, key=key, limit=limit)
+
+
 @router.put("/{key}")
 async def update_param(key: str, body: ConfigUpdate, session: AsyncSession = Depends(get_session)):
     """更新参数（实时生效；排除/保留列表保存后立即停用/恢复产品）"""
     try:
-        result = await config_service.set_param(session, key, body.value)
+        result = await config_service.set_param(session, key, body.value,
+                                               operator=body.operator, source="api")
         await _apply_listing_override(session, key)
         return result
     except KeyError as e:

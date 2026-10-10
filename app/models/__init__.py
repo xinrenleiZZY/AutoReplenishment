@@ -26,6 +26,7 @@ from app.models.semantic_classification import SemanticClassification
 from app.models.product_lists_raw import ProductListsRaw
 from app.models.purchase_order import PurchaseOrder
 from app.models.purchase_order_item import PurchaseOrderItem
+from app.models.config_audit import ConfigAuditLog
 
 __all__ = [
     "Product",
@@ -58,4 +59,5 @@ __all__ = [
     "ProductListsRaw",
     "PurchaseOrder",
     "PurchaseOrderItem",
+    "ConfigAuditLog",
 ]

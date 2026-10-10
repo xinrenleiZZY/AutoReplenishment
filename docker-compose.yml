@@ -11,7 +11,9 @@ services:
     ports:
       - "9101:8001"
     env_file:
-      - .env
+      # Phase 1 / G-09 环境分层：默认读根目录 .env；按环境切换用
+      #   $env:ENV_FILE="env/.env.staging"; docker compose up -d
+      - ${ENV_FILE:-.env}
     volumes:
       # 挂载 p_id 数据目录（产品/箱规/标签/销量快照文件），同步抓取结果同时持久化到宿主机
       - ./p_id:/app/p_id

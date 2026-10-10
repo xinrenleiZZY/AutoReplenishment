@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.config import ConfigParam
+from app.models.config_audit import ConfigAuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +189,13 @@ async def get_all_params(session: AsyncSession) -> list[dict]:
     return result
 
 
-async def set_param(session: AsyncSession, key: str, value) -> dict:
-    """写入参数（实时生效于后续计算）"""
+async def set_param(session: AsyncSession, key: str, value,
+                    operator: str | None = None, source: str | None = None) -> dict:
+    """写入参数（实时生效于后续计算），并留痕到 config_audit_logs（Phase 1 / G-12）。
+
+    留痕规则：只有值真正发生变化才写审计（避免定时任务/脚本重复写同一值刷屏）；
+    首次设置时 old_value 为空。
+    """
     if key not in PARAM_DEFS:
         raise KeyError(f"未知参数: {key}")
     default, _desc, value_type = PARAM_DEFS[key]
@@ -197,14 +203,47 @@ async def set_param(session: AsyncSession, key: str, value) -> dict:
     if casted is None:
         raise ValueError(f"参数 {key} 值无效: {value}")
     row = await _get_row(session, key)
+    old_value = row.param_value if row is not None else None
     if row is None:
         row = ConfigParam(param_key=key, param_value=str(casted))
         session.add(row)
     else:
         row.param_value = str(casted)
+    if str(old_value) != str(casted):
+        session.add(ConfigAuditLog(
+            param_key=key,
+            old_value=old_value,
+            new_value=str(casted),
+            operator=(operator or None),
+            source=(source or "unknown"),
+        ))
     await session.commit()
     apply_settings_override(key, casted)
     return {"key": key, "value": casted, "default": default, "type": value_type}
+
+
+async def list_audits(session: AsyncSession, key: str | None = None, limit: int = 100) -> list[dict]:
+    """参数变更历史（Phase 1 / G-12）：可按参数名过滤，按时间倒序。"""
+    from sqlalchemy import desc
+
+    q = select(ConfigAuditLog)
+    if key:
+        q = q.where(ConfigAuditLog.param_key == key)
+    rows = (await session.execute(
+        q.order_by(desc(ConfigAuditLog.changed_at), desc(ConfigAuditLog.id)).limit(max(1, min(limit, 500)))
+    )).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "param_key": r.param_key,
+            "old_value": r.old_value,
+            "new_value": r.new_value,
+            "operator": r.operator,
+            "source": r.source,
+            "changed_at": r.changed_at.isoformat() if r.changed_at else None,
+        }
+        for r in rows
+    ]
 
 
 def split_asins(raw) -> set:
@@ -215,8 +254,8 @@ def split_asins(raw) -> set:
 async def touch_asin_list(session: AsyncSession) -> str:
     """记录 ASIN 列表最近一次手动操作时间，并置「待刷新」标记（由每10分钟任务消费）"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await set_param(session, "asin_list_updated_at", now)
-    await set_param(session, "asin_list_refresh_pending", 1)
+    await set_param(session, "asin_list_updated_at", now, source="system")
+    await set_param(session, "asin_list_refresh_pending", 1, source="system")
     return now
 
 
