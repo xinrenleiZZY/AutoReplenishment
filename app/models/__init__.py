@@ -27,6 +27,7 @@ from app.models.product_lists_raw import ProductListsRaw
 from app.models.purchase_order import PurchaseOrder
 from app.models.purchase_order_item import PurchaseOrderItem
 from app.models.config_audit import ConfigAuditLog
+from app.models.task_job import TaskJob
 
 __all__ = [
     "Product",
@@ -60,4 +61,5 @@ __all__ = [
     "PurchaseOrder",
     "PurchaseOrderItem",
     "ConfigAuditLog",
+    "TaskJob",
 ]

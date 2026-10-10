@@ -39,6 +39,7 @@ from app.tasks.calculation_tasks import (
 from app.integrations.feishu import FeishuNotifier
 from app.services import config_service
 from app.services import ai_eval
+from app.services import job_store
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ def _start_job(run_factory, progress: dict | None = None, kind: str | None = Non
     _jobs[job_id] = {"job_id": job_id, "kind": kind, "status": "running", "started_at": time.time(),
                      "finished_at": None, "stats": None, "error": None,
                      "progress": progress or {"total": 0, "done": 0, "percent": 0, "current_asin": None}}
+    # Phase 3 / B-04：任务落库（内存仍是实时进度来源，DB 用于留痕/重启后查询）
+    job_store.save_calc_job_bg(_jobs[job_id])
 
     async def _runner():
         try:
@@ -68,6 +71,7 @@ def _start_job(run_factory, progress: dict | None = None, kind: str | None = Non
             _jobs[job_id]["error"] = str(e)
         finally:
             _jobs[job_id]["finished_at"] = time.time()
+            await job_store.save_calc_job(_jobs[job_id])
 
     asyncio.create_task(_runner())
     return job_id
@@ -743,7 +747,7 @@ async def get_cost_table(
 async def trigger_batch_calculation():
     """手动触发批量计算（全量重算，异步任务，含实时进度）"""
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(lambda: run_batch_calculation(progress=progress), progress=progress)
+    job_id = _start_job(lambda: run_batch_calculation(progress=progress), progress=progress, kind="batch")
     return {
         "message": "批量计算已提交",
         "job_id": job_id,
@@ -808,7 +812,7 @@ async def clear_timeline_resets(session: AsyncSession = Depends(get_session)):
 async def trigger_due_calculation():
     """手动触发按等级频率计算（异步任务，含实时进度）"""
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(lambda: run_due_calculation(progress=progress), progress=progress)
+    job_id = _start_job(lambda: run_due_calculation(progress=progress), progress=progress, kind="due")
     return {
         "message": "按频率计算已提交",
         "job_id": job_id,
@@ -826,6 +830,7 @@ async def trigger_level_calculation(
     job_id = _start_job(
         lambda: run_level_calculation(level, progress=progress, lifecycles=lifecycles),
         progress=progress,
+        kind="level",
     )
     return {
         "message": f"{level.upper()} 级计算已提交",
@@ -838,6 +843,9 @@ async def trigger_level_calculation(
 async def get_job(job_id: str):
     """查询后台计算任务状态"""
     job = _jobs.get(job_id)
+    if job is None:
+        # Phase 3 / B-04：内存没有（例如 API 重启过）则回落数据库
+        job = await job_store.fetch_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return job
@@ -1111,7 +1119,7 @@ async def _run_single_with_sync(asin: str, progress: dict | None = None) -> dict
 async def trigger_single_calculation(asin: str):
     """手动触发单个ASIN计算：先全量重拉三项数据（销量/库存/待到货量），再计算并私发负责人"""
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": asin, "stage": None}
-    job_id = _start_job(lambda: _run_single_with_sync(asin, progress=progress), progress=progress)
+    job_id = _start_job(lambda: _run_single_with_sync(asin, progress=progress), progress=progress, kind="single")
     return {
         "message": f"ASIN {asin} 已提交：正在重拉三项数据后分析",
         "job_id": job_id,
@@ -1406,6 +1414,7 @@ async def _run_single_notify_task(task: dict) -> None:
     """执行单ASIN报告私发任务：全量重拉三项数据 → 计算 → 私发负责人"""
     task["status"] = "running"
     task["started_at"] = datetime.now().isoformat(timespec="seconds")
+    await job_store.save_task_hall_single(task)   # Phase 3 / B-04：落库留痕
     try:
         task["stats"] = await _run_single_with_sync(task["asin"])
         task["status"] = "done"
@@ -1415,6 +1424,7 @@ async def _run_single_notify_task(task: dict) -> None:
         logger.error("任务大厅单ASIN任务执行失败 ASIN=%s: %s", task["asin"], e)
     finally:
         task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        await job_store.save_task_hall_single(task)
 
 
 @router.post("/task-hall/single")
@@ -1474,6 +1484,7 @@ async def create_task_hall_single(
         if run_dt <= datetime.now():
             raise HTTPException(status_code=400, detail="定时时间需晚于当前时间")
         _single_tasks[task_id] = task
+        await job_store.save_task_hall_single(task)   # B-04：定时任务落库（重启后可恢复）
         scheduler.add_job(
             _run_single_notify_task,
             trigger=DateTrigger(run_date=run_dt),
@@ -1485,23 +1496,52 @@ async def create_task_hall_single(
         return {"message": f"定时任务已创建，将于 {run_dt:%Y-%m-%d %H:%M} 执行", "task": task}
 
     _single_tasks[task_id] = task
+    await job_store.save_task_hall_single(task)       # B-04：立即任务落库
     asyncio.create_task(_run_single_notify_task(task))
     return {"message": "任务已提交，正在执行", "task": task}
 
 
 @router.get("/task-hall/single")
 async def list_task_hall_single():
-    """任务大厅-单ASIN私发任务列表（内存登记）"""
-    tasks = sorted(_single_tasks.values(), key=lambda t: t["created_at"], reverse=True)
-    return {"tasks": tasks}
+    """任务大厅-单ASIN私发任务列表（内存实时态 + 数据库中 api 重启前的历史）
+
+    Phase 3 / B-04：内存里没有的任务（例如 API 重启过）从 task_jobs 表补齐，
+    这样"任务列表"不再因重启整片消失。
+    """
+    tasks = {t["id"]: t for t in _single_tasks.values()}
+    try:
+        for row in await job_store.list_jobs(kind="task-hall-single", limit=100):
+            if row["job_id"] in tasks:
+                continue
+            params = row.get("params") or {}
+            tasks[row["job_id"]] = {
+                "id": row["job_id"],
+                "asin": params.get("asin"),
+                "operator": row.get("operator"),
+                "run_at": params.get("run_at"),
+                "status": row["status"],
+                "created_at": row.get("created_at"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("completed_at"),
+                "stats": None,
+                "error": row.get("error"),
+                "from_db": True,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取任务大厅历史失败: %s", e)
+    return {"tasks": sorted(tasks.values(), key=lambda t: str(t.get("created_at") or ""), reverse=True)}
 
 
 @router.delete("/task-hall/single/{task_id}")
 async def cancel_task_hall_single(task_id: str):
     """取消（或删除）任务大厅-单ASIN私发任务"""
     task = _single_tasks.pop(task_id, None)
+    await job_store.mark_cancelled(task_id)   # B-04：取消也留痕（含重启前的定时任务）
     if task is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+        # 内存没有：可能是 API 重启前创建的任务，DB 里有记录就按"已取消"处理
+        if await job_store.fetch_job(task_id) is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {"message": "任务已取消（来自任务历史）"}
     from app.tasks.scheduler import get_scheduler
 
     scheduler = get_scheduler()

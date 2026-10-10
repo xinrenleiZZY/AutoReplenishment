@@ -74,6 +74,46 @@ async def lifespan(app: FastAPI):
     scheduler = setup_scheduler()
     set_scheduler(scheduler)
     scheduler.start()
+    # Phase 3 / B-04：后台任务持久化巡检 + 恢复未到期的定时任务
+    try:
+        from app.services import job_store
+
+        # 单 worker 部署：进程一重启，内存里的执行协程即消失 → 遗留 running 行立即判为中断
+        n = await job_store.mark_orphan_running_interrupted()
+        logger.info(f"启动巡检：标记 {n} 条遗留 running 后台任务为 interrupted")
+        n2 = await job_store.mark_stale_running_interrupted(6)
+        logger.info(f"启动巡检：标记 {n2} 条超时后台任务为 interrupted")
+    except Exception as e:
+        logger.error(f"启动巡检（后台任务）失败: {e}")
+    try:
+        from datetime import datetime
+
+        from apscheduler.triggers.date import DateTrigger
+
+        from app.api.v1.calculation import _run_single_notify_task, _single_tasks
+        from app.services.job_store import pending_scheduled_singles
+
+        for p in await pending_scheduled_singles():
+            if not p.get("asin") or not p.get("run_at"):
+                continue
+            run_dt = datetime.fromisoformat(str(p["run_at"]))
+            if run_dt <= datetime.now():
+                continue
+            task = {
+                "id": p["task_id"], "asin": p["asin"], "operator": p.get("operator"),
+                "run_at": p["run_at"], "status": "pending",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "started_at": None, "finished_at": None, "stats": None, "error": None,
+            }
+            _single_tasks[p["task_id"]] = task
+            scheduler.add_job(
+                _run_single_notify_task, trigger=DateTrigger(run_date=run_dt), args=[task],
+                id=f"task_hall_single_{p['task_id']}", name=f"单ASIN私发 {p['asin']}",
+                replace_existing=True,
+            )
+            logger.info(f"启动恢复定时任务：{p['asin']} @ {run_dt:%Y-%m-%d %H:%M}")
+    except Exception as e:
+        logger.error(f"启动恢复定时任务失败: {e}")
     yield
     # 关闭时
     scheduler.shutdown()
