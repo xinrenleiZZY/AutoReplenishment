@@ -87,7 +87,13 @@ def evaluate_special_orders(
     trend_coeff = history.get("trend_coeff")
     if trend_coeff is not None:
         yoy = float(trend_coeff)
-        yoy_desc = f"节日窗口趋势系数{yoy:.2f}（今年近30天÷去年同30天）"
+        yoy_raw = history.get("trend_coeff_raw")
+        yoy_raw = float(yoy_raw) if yoy_raw is not None else yoy
+        # 最终趋势系数上限 1.5：被封顶时文字表述标注原值
+        if yoy_raw - yoy > 1e-9:
+            yoy_desc = f"节日窗口趋势系数{yoy:.2f}（原值：{yoy_raw:.2f}）（今年近30天÷去年同30天）"
+        else:
+            yoy_desc = f"节日窗口趋势系数{yoy:.2f}（今年近30天÷去年同30天）"
     else:
         yoy = (monthly_avg / last_year_same_month) if last_year_same_month > 0 else None
         yoy_desc = f"今年均量{monthly_avg}为去年同月{last_year_same_month}的{yoy:.0%}" if yoy is not None else ""

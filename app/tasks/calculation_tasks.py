@@ -776,7 +776,8 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
                         f"长期产品窗口 {history.get('lt_window_start')}~{history.get('lt_window_end')}："
                         f"去年同窗口合计={history.get('lt_base_total')}台（各月逐日求和，首尾月为不完整月），"
                         f"近30天={history.get('lt_recent_30d_qty')} / 去年同30天={history.get('lt_last_year_30d_qty')}"
-                        f"，趋势系数={history.get('lt_trend_coeff')}")
+                        f"，趋势系数={_fmt_trend_coeff(history.get('lt_trend_coeff'), history.get('lt_trend_coeff_raw'))}"
+                        f"（上限{TREND_COEFF_MAX}，超过直接用上限）")
         recorder.record(4, "历史销量分析（老品）", _step4, input_data={"asin": asin}, reason=_reason)
 
     # ── Step 5: 预测未来销量（老品 forecast.py 模型；新品走第六章窗口口径） ──
@@ -2474,6 +2475,7 @@ async def _analyze_sales_history(
         "recent_30d_qty": fw["recent_30d_qty"],
         "last_year_30d_qty": fw["last_year_30d_qty"],
         "trend_coeff": fw["trend_coeff"],
+        "trend_coeff_raw": fw["trend_coeff_raw"],
     } if fw else {}
 
     # 老品-长期产品：去年同窗口（明天→当前月+2 月末）各月逐日销量 + 占比 + 趋势系数
@@ -2489,6 +2491,7 @@ async def _analyze_sales_history(
         "lt_recent_30d_qty": lt["recent_30d_qty"],
         "lt_last_year_30d_qty": lt["last_year_30d_qty"],
         "lt_trend_coeff": lt["trend_coeff"],
+        "lt_trend_coeff_raw": lt["trend_coeff_raw"],
     } if lt else {}
 
     # 历史月度统计：仅用于金额类指标
@@ -2637,6 +2640,23 @@ def _month_end(d: date, offset_months: int = 0) -> date:
     return date(y, m, calendar.monthrange(y, m)[1])
 
 
+# 趋势系数上限：超过直接用 1.5（封顶），原值在文字表述中标注
+TREND_COEFF_MAX = 1.5
+
+
+def _fmt_trend_coeff(capped, raw, ndigits: int = 2) -> str:
+    """趋势系数文字表述：被 1.5 封顶时输出「1.50（原值：X.XX）」，否则只输出数值"""
+    if capped is None:
+        return "-"
+    cap = round(float(capped), ndigits)
+    if raw is None:
+        return f"{cap:.{ndigits}f}"
+    raw_val = round(float(raw), ndigits)
+    if raw_val > cap:
+        return f"{cap:.{ndigits}f}（原值：{raw_val:.{ndigits}f}）"
+    return f"{cap:.{ndigits}f}"
+
+
 async def _festival_sales_window(
     product: Product, session: AsyncSession, today: date | None = None
 ) -> dict | None:
@@ -2650,7 +2670,7 @@ async def _festival_sales_window(
       3. 各月销量 = 去年窗口内**逐日求和**，**首尾月为不完整月**
          （首月自 window_start 起、末月截至 window_end）；
       4. 各月占比 = 该月销量 ÷ 窗口合计（基准一致）；
-      5. 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0）。
+      5. 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0），上限 1.5（超过直接用 1.5）。
 
     返回 None：非节日产品 / 长期产品 / 未匹配到 festival_calendar /
     festival_end 缺失或已早于「明天」（该情况本轮不处理，由人工修订表数据）。
@@ -2720,7 +2740,9 @@ async def _festival_sales_window(
     last_year_30d_qty = await sum_daily_sales_dual(
         product.asin, _shift_year(this_30d_start, -1), _shift_year(today, -1), session
     ) or 0
-    trend_coeff = round(recent_30d_qty / last_year_30d_qty, 4) if last_year_30d_qty > 0 else 1.0
+    trend_coeff_raw = round(recent_30d_qty / last_year_30d_qty, 4) if last_year_30d_qty > 0 else 1.0
+    # 最终趋势系数口径：上限 1.5（超过直接用 1.5，原值另存便于文字表述）
+    trend_coeff = round(min(trend_coeff_raw, TREND_COEFF_MAX), 4)
 
     return {
         "festival": name,
@@ -2735,6 +2757,7 @@ async def _festival_sales_window(
         "recent_30d_qty": recent_30d_qty,
         "last_year_30d_qty": last_year_30d_qty,
         "trend_coeff": trend_coeff,
+        "trend_coeff_raw": trend_coeff_raw,
         "hot_end_month": int(rec.hot_end_month or window_end.month),
     }
 
@@ -2749,7 +2772,7 @@ async def _long_term_sales_window(
          首月（当前月）通常不是完整月（除非今天为 1 号），第 2、3 个月为完整月；
       2. 去年同期窗口 = 整个窗口年份 −1（逐日求和，首尾月同样为不完整月）；
       3. 各月销量 = 去年窗口内**逐日求和**；各月占比 = 该月销量 ÷ 窗口合计；
-      4. 趋势系数 = 最近30天销量 ÷ 去年同期30天销量（去年为 0 → 1.0）；
+      4. 趋势系数 = 最近30天销量 ÷ 去年同期30天销量（去年为 0 → 1.0），上限 1.5（超过直接用 1.5）；
       5. 未来预测总销量 = 去年同期窗口基数 × 趋势系数；
          当月预测销量 = 未来预测总销量 × 去年该月占比（Step 5 产出、Step 9 批次规划用）。
 
@@ -2789,7 +2812,9 @@ async def _long_term_sales_window(
     last_year_30d_qty = await sum_daily_sales_dual(
         product.asin, _shift_year(this_30d_start, -1), _shift_year(today, -1), session
     ) or 0
-    trend_coeff = round(recent_30d_qty / last_year_30d_qty, 4) if last_year_30d_qty > 0 else 1.0
+    trend_coeff_raw = round(recent_30d_qty / last_year_30d_qty, 4) if last_year_30d_qty > 0 else 1.0
+    # 最终趋势系数口径：上限 1.5（超过直接用 1.5，原值另存便于文字表述）
+    trend_coeff = round(min(trend_coeff_raw, TREND_COEFF_MAX), 4)
 
     return {
         "window_start": window_start,
@@ -2802,6 +2827,7 @@ async def _long_term_sales_window(
         "recent_30d_qty": recent_30d_qty,
         "last_year_30d_qty": last_year_30d_qty,
         "trend_coeff": trend_coeff,
+        "trend_coeff_raw": trend_coeff_raw,
     }
 
 
@@ -2958,7 +2984,7 @@ async def _forecast_sales_new_product(product: Product, session: AsyncSession) -
 def _forecast_sales_festival(history: dict) -> dict | None:
     """节日老品未来销量预测（用户确认口径，Step 4 提供基数与趋势系数）
 
-    - 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0，已在 Step 4 兜底）；
+    - 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0，已在 Step 4 兜底并封顶 1.5）；
     - 未来总量 = 去年窗口合计（基数）× 趋势系数；
     - 各月预测 = 去年该月（窗口内逐日求和口径，首尾月为不完整月）× 趋势系数，
       保留季节性分布，Σ = 基数 × 趋势系数。
@@ -3001,7 +3027,7 @@ def _forecast_sales_festival(history: dict) -> dict | None:
 def _forecast_sales_long_term(history: dict) -> dict | None:
     """老品-长期产品未来销量预测（Q8 口径，Step 4 提供基数、趋势系数与各月占比）
 
-    - 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0，已在 Step 4 兜底）；
+    - 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0，已在 Step 4 兜底并封顶 1.5）；
     - 未来预测总销量 = 去年同期窗口基数（window 合计）× 趋势系数；
     - 当月预测销量 = 未来预测总销量 × 去年该月占比（Σ 各月 = 总销量）；
     - 各月占比一并保留（Step 9 采购批次规划用）。
@@ -4187,7 +4213,7 @@ async def _calc_festival_window(product: Product, session: AsyncSession, invento
     新口径（用户确认）：
       1. 今年窗口 = [明天, 今年 festival_calendar.festival_end]，去年同期 = [去年明天, 去年 festival_end]；
       2. 基数 = 去年窗口各月**逐日求和**（首尾月为不完整月）；
-      3. 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0）；
+      3. 趋势系数 = 今年近30天销量 ÷ 去年同30天销量（去年为 0 → 1.0），上限 1.5（超过直接用 1.5）；
       4. 今年窗口总需求 = 基数 × 趋势系数；各月需求 = 去年该月 × 趋势系数；
       5. 剩余需求 = 窗口总需求 − 窗口内已售 − 可用库存 − 本地仓 − 采购在途。
 
@@ -4233,6 +4259,9 @@ async def _calc_festival_window(product: Product, session: AsyncSession, invento
         "this_year_30d": fw["recent_30d_qty"],
         "last_year_30d": fw["last_year_30d_qty"],
         "g": round(trend - 1.0, 4),
+        "g_raw": round(fw["trend_coeff_raw"] - 1.0, 4),
+        "trend_coeff": trend,
+        "trend_coeff_raw": fw["trend_coeff_raw"],
         "window_estimate": window_estimate,
         "window_days": window_days,
         "remaining": remaining,
@@ -4353,9 +4382,13 @@ async def _calc_festival_window_legacy(product: Product, session: AsyncSession, 
         g = (this_year_30d - last_year_30d) / last_year_30d
     else:
         g = 0.0
+    # 最终趋势系数口径：上限 1.5（超过直接用 1.5；原值 g 另存便于文字表述）
+    trend_coeff_raw = 1 + g
+    trend_coeff = round(min(trend_coeff_raw, TREND_COEFF_MAX), 4)
+    g_capped = round(trend_coeff - 1.0, 4)
 
-    # ── 今年窗口总销量 = 窗口基准 × (1 + G) ──
-    window_estimate = round(baseline * (1 + g))
+    # ── 今年窗口总销量 = 窗口基准 × 趋势系数 ──
+    window_estimate = round(baseline * trend_coeff)
 
     # ── 窗口内已售：今年窗口起始（首个月1号）→ 窗口结束（末个月月末），不超出今天 ──
     win_start = date(festival_year, min(window_months), 1)
@@ -4380,15 +4413,15 @@ async def _calc_festival_window_legacy(product: Product, session: AsyncSession, 
     month_estimate = {}
     for m in window_months:
         bm = last_year_by_month.get(f"{baseline_year}-{m:02d}", 0)
-        month_estimate[m] = round(bm * (1 + g))
+        month_estimate[m] = round(bm * trend_coeff)
     future_months = [m for m in window_months if m >= today.month] or list(window_months)
     hot_end_month = int(rec.hot_end_month or max(window_months))
 
-    # 库存覆盖天数：与节日主口径同源（去年各月 × (1+G) → 按各月天数逐月扣减可用库存）
+    # 库存覆盖天数：与节日主口径同源（去年各月 × 趋势系数 → 按各月天数逐月扣减可用库存）
     coverage = _window_coverage(
         inventory,
         {"monthly_sales": [{"month": k, "qty": v} for k, v in sorted(last_year_by_month.items())],
-         "trend_coeff": 1 + g},
+         "trend_coeff": trend_coeff},
         win_start, win_end,
     )
 
@@ -4399,7 +4432,10 @@ async def _calc_festival_window_legacy(product: Product, session: AsyncSession, 
         "last_year_by_month": last_year_by_month,
         "this_year_30d": this_year_30d,
         "last_year_30d": last_year_30d,
-        "g": g,
+        "g": g_capped,
+        "g_raw": round(g, 4),
+        "trend_coeff": trend_coeff,
+        "trend_coeff_raw": round(trend_coeff_raw, 4),
         "window_estimate": window_estimate,
         "window_days": window_days,
         "remaining": remaining,
@@ -4531,7 +4567,13 @@ def _calc_purchase_trigger(forecast: dict, inventory: dict, product: Product, le
             stock = int(inventory.get("available_stock") or 0)
             inventory_days = _cov["days"]
             inventory["inventory_days"] = inventory_days
-            reason = (f"节日窗口[{window_label}]预估总需求{est}（{int((festival_window.get('g') or 0)*100)}%同期增长），"
+            # 同期增长 = 趋势系数 − 1（已按上限 1.5 封顶）；被封顶时标注原值
+            _g = float(festival_window.get("g") or 0)
+            _g_raw = festival_window.get("g_raw")
+            _growth = f"{int(round(_g * 100))}%同期增长"
+            if _g_raw is not None and abs(float(_g_raw) - _g) > 1e-9:
+                _growth += f"（原值：{int(round(float(_g_raw) * 100))}%）"
+            reason = (f"节日窗口[{window_label}]预估总需求{est}（{_growth}），"
                       f"库存{stock}＋在途缺口{remaining}；{_cov['formula']}，需提前补货")
             recommended = "海运"
             if hot_end and hot_end > date.today().month and hot_end - date.today().month <= 2:
