@@ -3,16 +3,17 @@
 import pytest
 
 import app.tasks.calculation_tasks as ct
+from app.services.calc import schedule as calc_schedule
 from app.models.product import Product
 from datetime import date
 
 
 @pytest.fixture(autouse=True)
 def reset_freq_cache():
-    """保证每次测试重新解析频率配置（模块级缓存）"""
-    ct._FREQ_CACHE = None
+    """保证每次测试重新解析频率配置（模块级缓存；C1 拆分后缓存位于 calc.schedule）"""
+    calc_schedule._FREQ_CACHE = None
     yield
-    ct._FREQ_CACHE = None
+    calc_schedule._FREQ_CACHE = None
 
 
 def make_product(product_level=None, calc_frequency=None):
