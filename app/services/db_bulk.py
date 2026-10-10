@@ -13,9 +13,11 @@ sync_asin_wait_quantity 都在"一个长事务里逐行 UPDATE products"，彼�
 
 import asyncio
 import logging
+from datetime import date, datetime
 
 from sqlalchemy import bindparam, text
 
+from app.models.inventory import InventorySnapshot
 from app.models.product import Product
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,23 @@ _UPD_STMT = (
     .where(_PROD.c.asin == bindparam("b_asin"))
     .values(purchase_on_order=bindparam("b_qty"))
 )
+
+# FBA 三列（sync_fba_stock_web）：同样按 asin 升序 + 分块，避免 4767 行长事务夹在
+# purchase_orders / pending_stock 之间造成死锁（Phase 1 / G-17）。
+_FBA_UPD_STMT = (
+    _PROD.update()
+    .where(_PROD.c.asin == bindparam("b_asin"))
+    .values(
+        afn_fulfillable_quantity=bindparam("b_avail"),
+        afn_reserved_quantity=bindparam("b_reserved"),
+        afn_inbound_shipped_quantity=bindparam("b_inbound"),
+        updated_at=bindparam("b_updated_at"),
+    )
+)
+
+_SNAP = InventorySnapshot.__table__
+_SNAP_DEL = _SNAP.delete().where(_SNAP.c.snapshot_date == bindparam("b_date"))
+_SNAP_INS = _SNAP.insert()
 
 CHUNK_SIZE = 500
 MAX_RETRIES = 3
@@ -132,4 +151,87 @@ async def replace_purchase_on_order(session_factory, rows: dict[str, int]) -> in
                 raise
             await asyncio.sleep(0.5 * attempt)
             logger.warning("原子替换 purchase_on_order 第%d次重试（%s）", attempt, type(e).__name__)
+    return 0
+
+
+async def update_products_fba_stock(session_factory,
+                                    rows: dict[str, tuple[int, int, int]]) -> int:
+    """把 {asin: (FBA可售, FBA预留, FBA在途)} 批量写回 products（Phase 1 / G-17）。
+
+    替代 `sync_fba_stock_web` 原先"单事务逐行 UPDATE 4767 行"的写法：
+      · 按 asin 升序（与 purchase_orders / pending_stock 加锁顺序一致）
+      · 每 500 行一个短事务 + SET LOCAL lock_timeout
+      · 死锁/序列化失败自动重试
+    返回成功写入的 ASIN 数。
+    """
+    items = sorted((str(a), v) for a, v in (rows or {}).items() if a)
+    if not items:
+        return 0
+
+    written = 0
+    for i in range(0, len(items), CHUNK_SIZE):
+        chunk = items[i:i + CHUNK_SIZE]
+        now = datetime.now()
+        params = [{"b_asin": a, "b_avail": int(v[0]), "b_reserved": int(v[1]),
+                   "b_inbound": int(v[2]), "b_updated_at": now} for a, v in chunk]
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with session_factory() as s:
+                    await _set_lock_timeout(s)
+                    await s.execute(_FBA_UPD_STMT, params)
+                    await s.commit()
+                written += len(chunk)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt >= MAX_RETRIES or not _is_retryable(e):
+                    logger.error("批量写 products FBA 库存失败（第%d块，已试%d次）: %s",
+                                 i // CHUNK_SIZE + 1, attempt, e)
+                    raise
+                await asyncio.sleep(0.5 * attempt)
+                logger.warning("products FBA 库存 第%d块 第%d次重试（%s）",
+                               i // CHUNK_SIZE + 1, attempt, type(e).__name__)
+    return written
+
+
+async def replace_inventory_snapshot(session_factory, snapshot_date: date,
+                                     rows: dict[str, dict]) -> int:
+    """**原子替换**某一日的 inventory_snapshots（Phase 1 / G-17）。
+
+    rows: {asin: {"fba_available":int, "fba_reserved":int, "fba_inbound":int}}
+    "删除当日 + 分批插入"在**同一事务**内完成（幂等），并按 asin 升序插入，
+    避免先删后插两步之间失败导致当日快照整体丢失。
+    """
+    items = sorted((str(a), v or {}) for a, v in (rows or {}).items() if a)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session_factory() as s:
+                await _set_lock_timeout(s)
+                await s.execute(_SNAP_DEL, {"b_date": snapshot_date})
+                now = datetime.now()
+                for i in range(0, len(items), CHUNK_SIZE):
+                    chunk = items[i:i + CHUNK_SIZE]
+                    await s.execute(_SNAP_INS, [
+                        {
+                            "asin": a,
+                            "snapshot_date": snapshot_date,
+                            "fba_available": int(v.get("fba_available") or 0),
+                            "fba_reserved": int(v.get("fba_reserved") or 0),
+                            "fba_inbound": int(v.get("fba_inbound") or 0),
+                            "fba_inbound_shipped": int(v.get("fba_inbound") or 0),
+                            "local_stock": int(v.get("local_stock") or 0),
+                            "purchase_on_order": int(v.get("purchase_on_order") or 0),
+                            "created_at": now,
+                        }
+                        for a, v in chunk
+                    ])
+                await s.commit()
+            return len(items)
+        except Exception as e:  # noqa: BLE001
+            if attempt >= MAX_RETRIES or not _is_retryable(e):
+                logger.error("原子替换 inventory_snapshots(%s) 失败（已试 %d 次）: %s",
+                             snapshot_date, attempt, e)
+                raise
+            await asyncio.sleep(0.5 * attempt)
+            logger.warning("inventory_snapshots(%s) 第%d次重试（%s）",
+                           snapshot_date, attempt, type(e).__name__)
     return 0

@@ -486,29 +486,39 @@ async def main(dry_run: bool = False, board_start: str | None = None, board_end:
     stats["source"] = "station" if station_enabled() else "direct"
     steps: dict[str, dict] = {}
     t0 = time.monotonic()
+    # 每步记录耗时（ms），供 scheduler 写步骤级子记录（Phase 1 / G-16：子行需有 started_at/completed_at/duration_ms）
+    t_step = time.monotonic()
     try:
         await sync_purchase_plan_items(stats, dry_run)
         steps["plan_items"] = {"ok": True, "total": stats.get("plan_items_total"),
-                               "written": stats.get("plan_items_written")}
+                               "written": stats.get("plan_items_written"),
+                               "ms": int((time.monotonic() - t_step) * 1000)}
     except Exception as e:
         stats["plan_items_error"] = str(e)
-        steps["plan_items"] = {"ok": False, "error": str(e)[:500]}
+        steps["plan_items"] = {"ok": False, "error": str(e)[:500],
+                               "ms": int((time.monotonic() - t_step) * 1000)}
         print(f"[ERROR] 采购计划(listNew)同步失败: {e}")
+    t_step = time.monotonic()
     try:
         await sync_purchase_board(stats, dry_run, start_date=board_start, end_date=board_end, all_time=board_all)
         steps["board"] = {"ok": True, "total": stats.get("board_total"),
-                          "written": stats.get("board_written")}
+                          "written": stats.get("board_written"),
+                          "ms": int((time.monotonic() - t_step) * 1000)}
     except Exception as e:
         stats["board_error"] = str(e)
-        steps["board"] = {"ok": False, "error": str(e)[:500]}
+        steps["board"] = {"ok": False, "error": str(e)[:500],
+                          "ms": int((time.monotonic() - t_step) * 1000)}
         print(f"[ERROR] 采购单看板同步失败: {e}")
+    t_step = time.monotonic()
     try:
         wait_stats = await sync_asin_wait_quantity(dry_run=dry_run)
         steps["wait_quantity"] = {"ok": True, "matched_asins": (wait_stats or {}).get("matched_asins"),
-                                  "wait_total": (wait_stats or {}).get("wait_total")}
+                                  "wait_total": (wait_stats or {}).get("wait_total"),
+                                  "ms": int((time.monotonic() - t_step) * 1000)}
     except Exception as e:
         stats["wait_error"] = str(e)
-        steps["wait_quantity"] = {"ok": False, "error": str(e)[:500]}
+        steps["wait_quantity"] = {"ok": False, "error": str(e)[:500],
+                                  "ms": int((time.monotonic() - t_step) * 1000)}
         print(f"[ERROR] ASIN待到货量计算失败: {e}")
 
     stats["steps"] = steps

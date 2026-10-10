@@ -454,6 +454,46 @@ export interface SyncOverview {
   sources: SyncSourceStat[];
 }
 
+/** Phase 0 / G-06：当日计算漏斗（到期 → 过滤 → 实际计算 → 跳过原因） */
+export interface CalculationRunSummary {
+  date: string;
+  enabled_products: number;
+  due: number;
+  due_by_level: Record<string, { total: number; due: number; frequency_days: number }>;
+  allowed_lifecycles: string[];
+  computed: number;
+  skipped_by_gate: Record<string, number>;
+  notes?: string[];
+}
+
+export interface CalculationSkipLog {
+  asin: string;
+  gate: string | null;
+  festival: string | null;
+  festival_name: string | null;
+  next_festival_date: string | null;
+  days_until: number | null;
+  reason: string | null;
+}
+
+/** Phase 1 / G-18：需要人工处理的同步告警 */
+export interface OpsAlert {
+  level: string;
+  kind: string;
+  target: string;
+  detail: string;
+  error_message?: string | null;
+  at?: string | null;
+}
+
+export interface OpsAlertsResponse {
+  checked_at: string;
+  count: number;
+  errors: number;
+  alerts: OpsAlert[];
+  healthy?: boolean;
+}
+
 export interface HealthStatus {
   status: string;
   env?: string;
@@ -978,6 +1018,13 @@ export const api = {
         { method: "POST", body: JSON.stringify(payload) }
       ),
     risks: () => fetchJSON<RiskReport>("/api/v1/calculation/risks"),
+    // Phase 0 / G-06：运行事实可解释（"今天为什么只算了 N 个"）
+    runSummary: (calcDate?: string) =>
+      fetchJSON<CalculationRunSummary>(`/api/v1/calculation/run-summary${calcDate ? `?calc_date=${calcDate}` : ""}`),
+    skipLogs: (calcDate?: string) =>
+      fetchJSON<{ calc_date: string; count: number; items: CalculationSkipLog[] }>(
+        `/api/v1/calculation/skip-logs${calcDate ? `?calc_date=${calcDate}` : ""}`
+      ),
     costTable: (asin: string, price?: number) =>
       fetchJSON<CostTable>(`/api/v1/calculation/cost-table/${asin}${price != null ? `?price=${price}` : ""}`),
     dailyReport: (includeResults = true) =>
@@ -1048,6 +1095,11 @@ export const api = {
       fetchJSON<{ message: string; sync_type: string }>(`/api/v1/sync-logs/run?sync_type=${syncType}`, { method: "POST" }),
   },
   syncOverview: () => fetchJSON<SyncOverview>("/api/v1/sync-overview"),
+  // Phase 1 / G-18：同步失败 / 产物为 0 / 新鲜度超阈值的告警清单
+  ops: {
+    alerts: () => fetchJSON<OpsAlertsResponse>("/api/v1/ops/alerts"),
+    syncFreshness: () => fetchJSON<Record<string, unknown>>("/api/v1/ops/sync-freshness"),
+  },
   ai: {
     evaluate: (asin: string) =>
       fetchJSON<AiEvaluationResult>(`/api/v1/ai/evaluate/${asin}`, { method: "POST" }),

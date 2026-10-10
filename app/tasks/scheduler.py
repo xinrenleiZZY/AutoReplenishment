@@ -126,21 +126,37 @@ def new_run_id() -> str:
 
 
 async def _write_step_rows(session, parent_id: int, sync_type: str, stats: dict | None,
-                           source: str | None = None, run_id: str | None = None) -> int:
+                           source: str | None = None, run_id: str | None = None,
+                           started_at: datetime | None = None,
+                           completed_at: datetime | None = None) -> int:
     """把 stats["steps"] 落成步骤级子记录（Phase 1 / G-16）。
 
     约定：脚本在 stats["steps"] 里给出 {步骤名: {"ok": bool, ...}}，
     本函数为每一步写一行 sync_logs（level="step"，parent_id=父行 id），
     这样"哪一步慢/哪一步错"可以直接按 run_id 查询。
+
+    终态完整性（2026-10-10 修复）：子行必须同时写 started_at / completed_at / duration_ms，
+    否则查询端无法计算"哪一步慢"。步骤耗时取自 info["ms"]（脚本每步实测），
+    按运行顺序累加得到各步的起止时间；缺少 ms 时退化为父行的运行区间。
     """
     steps = (stats or {}).get("steps") if isinstance(stats, dict) else None
     if not isinstance(steps, dict) or not steps:
         return 0
     n = 0
+    cursor = started_at  # 顺序累加：上一步结束 = 下一步开始
     for name, info in steps.items():
         info = info if isinstance(info, dict) else {"detail": info}
         ok = bool(info.get("ok"))
         err = info.get("error")
+        ms = info.get("ms")
+        ms = int(ms) if isinstance(ms, (int, float)) else None
+        step_started = cursor or started_at or datetime.now()
+        if ms is not None:
+            step_done = step_started + timedelta(milliseconds=ms)
+            cursor = step_done
+        else:
+            step_done = completed_at or step_started
+            cursor = step_done
         row = SyncLog(
             sync_type=sync_type,
             status="success" if ok else "failed",
@@ -153,6 +169,9 @@ async def _write_step_rows(session, parent_id: int, sync_type: str, stats: dict 
             success_count=info.get("written") or info.get("matched_asins"),
             error_message=(str(err)[:2000] if err else None),
             stats_json=json.dumps(info, ensure_ascii=False, default=str)[:10000],
+            started_at=step_started,
+            completed_at=step_done,
+            duration_ms=ms,
         )
         session.add(row)
         n += 1
@@ -491,7 +510,8 @@ async def sync_purchase_sources():
             # Phase 1 / G-16：步骤级子记录（计划明细 / 看板 / 待到货量）
             try:
                 await _write_step_rows(session, log.id, "purchase_sources", stats,
-                                       source=(stats or {}).get("source"), run_id=log.run_id)
+                                       source=(stats or {}).get("source"), run_id=log.run_id,
+                                       started_at=log.started_at, completed_at=log.completed_at)
                 await session.commit()
             except Exception as e:  # noqa: BLE001  子记录失败不影响主流程
                 logger.warning("写入步骤级记录失败: %s", e)

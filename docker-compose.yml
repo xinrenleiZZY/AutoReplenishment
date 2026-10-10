@@ -45,6 +45,8 @@ services:
       - TZ=Asia/Shanghai
       - API_BASE_URL=http://api:8001
       - NEXT_TELEMETRY_DISABLED=1
+      # Phase 0 / G-04：前端中间件在服务端把该 token 注入 /api/* 代理请求（不下发浏览器）
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN}
     depends_on:
       api:
         condition: service_healthy

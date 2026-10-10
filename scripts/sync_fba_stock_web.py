@@ -19,7 +19,7 @@ import argparse
 import asyncio
 import os
 import sys
-from datetime import date, datetime
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,10 +27,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from sqlalchemy import select, delete, update
+from sqlalchemy import select
 
 from app.database import async_session_factory
-from app.models.inventory import InventorySnapshot
 from app.models.product import Product
 from scripts.daily_sales_snapshot import fetch_all
 from app.services.raw_store import flush_raw
@@ -94,50 +93,37 @@ async def sync_fba_stock_web(dry_run: bool = False) -> int:
         return len(stocks)
 
     today = date.today()
-    s = async_session_factory()
-    try:
-        async with s:
-            # 只同步 products 中已存在的 ASIN（避免删除的/外部的 ASIN 触发外键
-            # 或重新引入，如 B0DHTJZ2YC 等已删除产品仍出现在 showOnline）
-            exist = (await s.execute(
-                select(Product.asin).where(Product.asin.in_(list(stocks.keys())))
-            )).scalars().all()
-            exist_set = set(exist)
-            stocks = {a: st for a, st in stocks.items() if a in exist_set}
-            print(f"过滤后写入 {len(stocks)} 个 ASIN（products 中存在）")
-            if not stocks:
-                return 0
-            # 写回 products 基础数据（分析直接读取）
-            for asin, st in stocks.items():
-                await s.execute(
-                    update(Product)
-                    .where(Product.asin == asin)
-                    .values(
-                        afn_fulfillable_quantity=st["fba_available"],
-                        afn_reserved_quantity=st["fba_reserved"],
-                        afn_inbound_shipped_quantity=st["fba_inbound"],
-                        updated_at=datetime.now(),
-                    )
-                )
-            # 幂等：清当日旧快照后写入
-            await s.execute(delete(InventorySnapshot).where(InventorySnapshot.snapshot_date == today))
-            for asin, st in stocks.items():
-                s.add(InventorySnapshot(
-                    asin=asin,
-                    snapshot_date=today,
-                    fba_available=st["fba_available"],
-                    fba_reserved=st["fba_reserved"],
-                    fba_inbound=st["fba_inbound"],
-                    fba_inbound_shipped=st["fba_inbound"],
-                    local_stock=0,
-                    purchase_on_order=0,
-                ))
-            await s.commit()
-            print(f"已写入 inventory_snapshots {len(stocks)} 条（{today}，网页API兜底）")
-            await flush_raw()
-            return len(stocks)
-    finally:
-        await s.close()
+    # 只同步 products 中已存在的 ASIN（避免删除的/外部的 ASIN 触发外键或重新引入，
+    # 如 B0DHTJZ2YC 等已删除产品仍出现在 showOnline）
+    async with async_session_factory() as s:
+        exist = (await s.execute(
+            select(Product.asin).where(Product.asin.in_(list(stocks.keys())))
+        )).scalars().all()
+    exist_set = set(exist)
+    stocks = {a: st for a, st in stocks.items() if a in exist_set}
+    print(f"过滤后写入 {len(stocks)} 个 ASIN（products 中存在）")
+    if not stocks:
+        return 0
+
+    # Phase 1 / G-17：改为 db_bulk 分块短事务（按 asin 升序 + lock_timeout + 死锁重试），
+    # 不再用"单事务逐行 UPDATE 4767 行"，也不再分两步做"清快照 → 写快照"。
+    from app.services.db_bulk import replace_inventory_snapshot, update_products_fba_stock
+
+    written = await update_products_fba_stock(
+        async_session_factory,
+        {a: (st["fba_available"], st["fba_reserved"], st["fba_inbound"])
+         for a, st in stocks.items()},
+    )
+    snap = await replace_inventory_snapshot(
+        async_session_factory, today,
+        {a: {"fba_available": st["fba_available"],
+             "fba_reserved": st["fba_reserved"],
+             "fba_inbound": st["fba_inbound"]}
+         for a, st in stocks.items()},
+    )
+    print(f"已写入 products FBA 库存 {written} 行、inventory_snapshots {snap} 条（{today}，网页API兜底）")
+    await flush_raw()
+    return written
 
 
 def main_cli():
