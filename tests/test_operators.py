@@ -2,6 +2,8 @@
 
 import uuid
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -91,6 +93,7 @@ def test_cost_table_endpoint_with_price_override():
         assert resp2.json()["conclusion_ok"] is True
 
 
+@pytest.mark.integration
 def test_overview_operator_filter():
     with TestClient(app) as client:
         resp = client.get("/api/v1/calculation/results/overview", params={"limit": 5})

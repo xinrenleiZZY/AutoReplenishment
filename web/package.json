@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev --port 9100",
     "build": "next build",
-    "start": "next start --port 9100"
+    "start": "next start --port 9100",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "^15.0.0",

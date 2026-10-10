@@ -1,5 +1,6 @@
 """DeepSeek AI 评估服务测试（不发起真实网络请求，验证失败回退）"""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -36,6 +37,7 @@ def test_ai_daily_report_falls_back(monkeypatch):
         assert "top_alerts" in body
 
 
+@pytest.mark.integration
 def test_ai_daily_report_input_includes_stockout(monkeypatch):
     """AI 日报输入包含断货风险数量与明细，总结不能只写'库存状况良好'"""
     import json

@@ -1,5 +1,6 @@
 """计算路由回归测试：/trigger/batch 与 /trigger/due 不能被 /trigger/{asin} 遮蔽"""
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app.api.v1.calculation as calc_api
@@ -13,6 +14,7 @@ def _fake_stats():
     }
 
 
+@pytest.mark.integration
 def test_trigger_batch_and_due_not_shadowed(monkeypatch):
     async def fake_due(progress=None):
         return _fake_stats()
@@ -99,6 +101,7 @@ def test_products_pagination():
         assert len(resp.json()["items"]) <= 20
 
 
+@pytest.mark.integration
 def test_analysis_summary_and_level_trigger(monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/api/v1/analysis/summary?level=S")

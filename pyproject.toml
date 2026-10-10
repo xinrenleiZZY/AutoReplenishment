@@ -1,0 +1,27 @@
+# 工程治理配置（Phase 1 / G-07 CI 质量门 + G-13 测试基线）
+#
+# 说明：
+#   · ruff 只开「语法/未定义名/重复定义」这类确定性规则（E9/F811/F821~F823），
+#     作为 CI 必过门禁；风格类规则（行长、import 排序等）暂不纳入，避免历史代码大面积漂红。
+#   · pytest 把「与实时生产数据强相关、会随数据漂移」的用例标记为 integration，
+#     CI 只跑确定性单测（-m "not integration"），集成用例手工跑。
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [
+    "web", "node_modules", "ms-playwright", "playwright_profile",
+    "p_id", "logs", "backups", "_tmp", "video", "reports", "docs",
+]
+
+[tool.ruff.lint]
+# E9  语法错误；F811 重复定义；F821/F822/F823 未定义名/未定义变量/赋值前引用
+select = ["E9", "F811", "F821", "F822", "F823"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: 依赖生产库/外部服务或与实时数据强相关的用例（CI 用 -m 'not integration' 跳过）",
+]
+asyncio_default_fixture_loop_scope = "function"

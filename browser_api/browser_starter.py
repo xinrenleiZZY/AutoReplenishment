@@ -14,7 +14,7 @@ import threading
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from .config import BROWSER_CDP_PORT, BROWSER_USER_DATA_DIR
-from .logger import setup_logger, log_info, log_error
+from .logger import setup_logger, log_info, log_error, log_warn
 
 
 def check_port_in_use(port: int) -> bool:

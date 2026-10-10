@@ -46,6 +46,7 @@ def test_check_acos():
     assert ok  # 无 ACOS 数据按达标放行，避免有销量的新品被误杀
 
 
+@pytest.mark.integration
 def test_calc_cost_table():
     table = np.calc_cost_table(_P())
     assert table["price"] == 30.0
@@ -115,6 +116,7 @@ def test_decision_long_term():
     assert d["plan"]["final_qty"] == 720
 
 
+@pytest.mark.integration
 def test_decision_festival():
     d = np.new_product_decision(_P(), [6, 7, 8], 0.4, 200, 12, "热卖期", date(2026, 10, 31), False, 20)
     assert d["level"] == "建议采购"
@@ -123,6 +125,7 @@ def test_decision_festival():
     assert len(d["steps"]) >= 5
 
 
+@pytest.mark.integration
 def test_run_new_product_flow_branch(monkeypatch):
     """新品决策分支编排：门禁通过后输出建议采购数量与批次"""
     import asyncio

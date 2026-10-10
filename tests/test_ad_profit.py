@@ -75,6 +75,7 @@ def test_parse_gross_margin_negative_kept():
     assert parse_gross_margin(resp) == -0.1234
 
 
+@pytest.mark.integration
 def test_product_ad_profit_metrics():
     """广告/利润联合字段：花费、占比、估算毛利率"""
     m = _product_ad_profit_metrics(_product())
