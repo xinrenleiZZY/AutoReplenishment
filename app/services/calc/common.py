@@ -5,6 +5,7 @@
 """
 
 import json
+import os
 from datetime import date, timedelta
 from typing import Optional
 
@@ -158,5 +159,16 @@ async def _fetch_acos(product: Product) -> Optional[float]:
         except (ValueError, TypeError):
             pass
     return None
+
+
+# ── C1 批3 追加：跨域常量 ──
+
+
+SECOND_PEAK_APPROACH_DAYS = 30  # 补货后库存覆盖到第二个高峰期开始前 N 天，视为“临近”
+
+
+_PID_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "p_id"
+)
 
 
