@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
+      args:
+        # 发布脚本会传 GIT_SHA；直接 compose build 时默认 unknown
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: auto_replenish_api
     restart: unless-stopped
     init: true

@@ -26,6 +26,7 @@ $prev = (docker images auto_replenish_api --format "{{.Tag}}" | Where-Object { $
 $prevWeb = (docker images auto_replenish_web --format "{{.Tag}}" | Where-Object { $_ -ne "latest" } | Select-Object -First 1)
 
 Write-Host "1/4 构建镜像..." -ForegroundColor Yellow
+$env:GIT_SHA = $sha   # 烧进镜像，供冒烟时核对"容器跑的版本 = 本次 commit"
 docker compose build api web
 if ($LASTEXITCODE -ne 0) { throw "构建失败，已中止（未切换容器）" }
 
@@ -58,6 +59,13 @@ if (-not $SkipSmoke) {
         Write-Host "  healthcheck => api:$st web:$stw"
         $ok = $ok -and ($st -ne "unhealthy") -and ($stw -ne "unhealthy")
     } catch { Write-Warning "  healthcheck 读取失败: $_" }
+    try {
+        # 核对镜像内烧入的 commit SHA，防止"构建了但容器仍是旧镜像"
+        $inner = (docker exec auto_replenish_api printenv APP_BUILD_SHA).Trim()
+        Write-Host "  容器内 APP_BUILD_SHA => $inner（本次 $sha）"
+        if ($inner -ne $sha) { $ok = $false; Write-Warning "  容器内版本与本次发布不一致，请用 --force-recreate 重新切换" }
+    } catch { Write-Warning "  APP_BUILD_SHA 读取失败: $_" }
+    Remove-Item Env:\GIT_SHA -ErrorAction SilentlyContinue
     if (-not $ok) {
         Write-Warning "冒烟未全绿：可执行 scripts\rollback.ps1 回滚到上一个标签"
     } else {

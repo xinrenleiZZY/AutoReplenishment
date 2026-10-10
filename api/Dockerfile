@@ -2,6 +2,10 @@
 # 注意：保持单 worker 运行，避免 APScheduler 定时任务在多个 worker 中重复执行
 FROM python:3.12-slim-bookworm
 
+# Phase 1 / G-10：把构建时的 commit SHA 烧进镜像，发布后可核对"容器跑的到底是哪一版"
+ARG GIT_SHA=unknown
+ENV APP_BUILD_SHA=$GIT_SHA
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
