@@ -25,18 +25,22 @@ from app.models.sync_log import SyncLog
 
 router = APIRouter()
 
-# (标签, 模型, 日期列, 允许滞后天数, 说明)
-_FRESHNESS_CHECKS = [
-    ("products", None, None, 0, "产品档案由同步任务回写，无独立日期列（用 sync_logs 判断）"),
-    ("领星销售快照", DailySalesSnapshot, DailySalesSnapshot.snapshot_date, 0, "showOnline 每日快照"),
-    ("库存快照", InventorySnapshot, InventorySnapshot.snapshot_date, 0, "FBA 库存每日快照"),
-    ("逐日销量", DailySalesStat, DailySalesStat.stat_date, 1, "领星 sales-statistics 逐日"),
-    ("销量明细", SalesData, SalesData.date, 1, "快照转日明细"),
-    ("计算结果", CalculationResult, CalculationResult.calc_date, 0, "每日主流程产出"),
-    ("采购计划明细", PurchasePlanItem, PurchasePlanItem.fetch_date, 0, "listNew 全量替换（失败会保留旧日期）"),
-    ("采购单看板", PurchaseOrderBoard, PurchaseOrderBoard.fetch_date, 0, "purchaseOrderBoard 全量替换"),
-    ("经营利润报表", ProfitReportStat, ProfitReportStat.stat_date, 1, "按日报，滞后 1 天属正常"),
-]
+# 新鲜度检查清单与数据门禁（B-05）同源，避免两处口径漂移
+from app.services.data_gate import FRESHNESS_CHECKS as _FRESHNESS_CHECKS  # noqa: E402
+
+
+@router.get("/data-gate", summary="上游数据门禁与熔断状态（Phase 3 / B-05）")
+async def data_gate_status(session: AsyncSession = Depends(get_session)):
+    """回答"现在能不能出采购建议"：关键表新鲜度、关键同步熔断状态、手工闸门状态。
+
+    ok=false 时，定时（按频率）计算会被阻断并写入 sync_logs(sync_type=data_gate)，
+    该记录会出现在 /sync-freshness 的 abnormal_sync 与 /alerts 告警里。
+    """
+    from app.services import data_gate, manual_guard
+
+    result = await data_gate.evaluate(session)
+    result["manual_guard"] = manual_guard.manual_gate.snapshot()
+    return result
 
 
 @router.get("/sync-freshness", summary="同步产物新鲜度 + 最近同步终态")

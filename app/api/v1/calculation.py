@@ -40,6 +40,7 @@ from app.integrations.feishu import FeishuNotifier
 from app.services import config_service
 from app.services import ai_eval
 from app.services import job_store
+from app.services import manual_guard
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -746,8 +747,18 @@ async def get_cost_table(
 @router.post("/trigger/batch")
 async def trigger_batch_calculation():
     """手动触发批量计算（全量重算，异步任务，含实时进度）"""
+    ok, deny = await manual_guard.manual_gate.acquire("batch")
+    if not ok:
+        raise HTTPException(status_code=429, detail=deny)
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(lambda: run_batch_calculation(progress=progress), progress=progress, kind="batch")
+
+    async def _guarded():
+        try:
+            return await run_batch_calculation(progress=progress)
+        finally:
+            manual_guard.manual_gate.release("batch")
+
+    job_id = _start_job(_guarded, progress=progress, kind="batch")
     return {
         "message": "批量计算已提交",
         "job_id": job_id,
@@ -809,10 +820,22 @@ async def clear_timeline_resets(session: AsyncSession = Depends(get_session)):
 
 
 @router.post("/trigger/due")
-async def trigger_due_calculation():
-    """手动触发按等级频率计算（异步任务，含实时进度）"""
+async def trigger_due_calculation(
+    ignore_gate: bool = Query(False, description="跳过 B-05 数据门禁（默认不跳过；跳过会写入告警日志）"),
+):
+    """手动触发按等级频率计算（异步任务，含实时进度）；默认受数据门禁约束。"""
+    ok, deny = await manual_guard.manual_gate.acquire("due")
+    if not ok:
+        raise HTTPException(status_code=429, detail=deny)
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(lambda: run_due_calculation(progress=progress), progress=progress, kind="due")
+
+    async def _guarded():
+        try:
+            return await run_due_calculation(progress=progress, ignore_gate=ignore_gate)
+        finally:
+            manual_guard.manual_gate.release("due")
+
+    job_id = _start_job(_guarded, progress=progress, kind="due")
     return {
         "message": "按频率计算已提交",
         "job_id": job_id,
@@ -826,12 +849,18 @@ async def trigger_level_calculation(
     lifecycles: Optional[str] = Query(None, description="按生命周期过滤，逗号分隔，如 启动期,增长期,热卖期；不传=全部"),
 ):
     """立即计算指定等级（S/A/B/C/D），忽略频率（异步任务，含实时进度）"""
+    ok, deny = await manual_guard.manual_gate.acquire(f"level-{level}")
+    if not ok:
+        raise HTTPException(status_code=429, detail=deny)
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": None}
-    job_id = _start_job(
-        lambda: run_level_calculation(level, progress=progress, lifecycles=lifecycles),
-        progress=progress,
-        kind="level",
-    )
+
+    async def _guarded():
+        try:
+            return await run_level_calculation(level, progress=progress, lifecycles=lifecycles)
+        finally:
+            manual_guard.manual_gate.release(f"level-{level}")
+
+    job_id = _start_job(_guarded, progress=progress, kind="level")
     return {
         "message": f"{level.upper()} 级计算已提交",
         "job_id": job_id,
@@ -1116,10 +1145,29 @@ async def _run_single_with_sync(asin: str, progress: dict | None = None) -> dict
 
 
 @router.post("/trigger/{asin}")
-async def trigger_single_calculation(asin: str):
-    """手动触发单个ASIN计算：先全量重拉三项数据（销量/库存/待到货量），再计算并私发负责人"""
+async def trigger_single_calculation(
+    asin: str,
+    force: bool = Query(False, description="定时同步窗口内强制触发（默认拒绝，避免抢占定时任务配额）"),
+):
+    """手动触发单个ASIN计算：先全量重拉三项数据（销量/库存/待到货量），再计算并私发负责人
+
+    Phase 3 / B-06：07:00–09:00 定时同步窗口内默认拒绝（force=true 可强制）；
+    同类任务串行 + 最小间隔，避免并发全量同步互相争抢外部接口。
+    """
+    if manual_guard.in_sync_window() and not force:
+        raise HTTPException(status_code=409, detail=manual_guard.window_reason())
+    ok, deny = await manual_guard.manual_gate.acquire("single-fullsync")
+    if not ok:
+        raise HTTPException(status_code=429, detail=deny)
     progress = {"total": 0, "done": 0, "percent": 0, "current_asin": asin, "stage": None}
-    job_id = _start_job(lambda: _run_single_with_sync(asin, progress=progress), progress=progress, kind="single")
+
+    async def _guarded():
+        try:
+            return await _run_single_with_sync(asin, progress=progress)
+        finally:
+            manual_guard.manual_gate.release("single-fullsync")
+
+    job_id = _start_job(_guarded, progress=progress, kind="single")
     return {
         "message": f"ASIN {asin} 已提交：正在重拉三项数据后分析",
         "job_id": job_id,

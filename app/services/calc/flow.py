@@ -1724,7 +1724,8 @@ async def run_single_calculation(asin: str, session: AsyncSession) -> dict:
     return result_dict
 
 
-async def run_due_calculation(force: bool = False, progress: dict | None = None) -> dict:
+async def run_due_calculation(force: bool = False, progress: dict | None = None,
+                              ignore_gate: bool = False) -> dict:
     """按等级频率计算到期产品（S 每天、A 每3天、B 每5天、C 每7天、D 每14天，可自定义）
 
     force=True 时忽略频率，全量重算所有启用产品。
@@ -1732,6 +1733,22 @@ async def run_due_calculation(force: bool = False, progress: dict | None = None)
     """
     mode = "全量" if force else "按频率"
     logger.info("===== %s计算任务开始 =====", mode)
+    # Phase 3 / B-05：上游数据门禁——关键表过期 / 关键同步连续失败 → 阻断，不再照常出采购建议
+    if ignore_gate:
+        logger.warning("本次按频率计算显式跳过数据门禁（ignore_gate=true），结果可能基于过期上游数据")
+    if not force and not ignore_gate:
+        try:
+            from app.services import data_gate
+
+            async with async_session_factory() as gate_session:
+                gate = await data_gate.evaluate(gate_session)
+                await data_gate.record(gate_session, gate, source="scheduler")
+            if not gate["ok"]:
+                logger.warning("数据门禁阻断按频率计算：%s", "；".join(gate["reasons"]))
+                return {"blocked": True, "reasons": gate["reasons"], "warnings": gate["warnings"],
+                        "checks": gate["checks"], "breaker": gate["breaker"]}
+        except Exception as e:  # noqa: BLE001  门禁自身异常不阻断主流程
+            logger.warning("数据门禁检查失败（放行）：%s", e)
     session = async_session_factory()
     try:
         async with session:
